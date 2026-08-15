@@ -1,0 +1,146 @@
+name: f711-rocm
+
+# Minimal single-target ROCm/HIP build for the f711 R9700 (gfx1201) stack.
+#
+# Derived verbatim from the `windows-rocm` job in release.yml, with three changes:
+#   1. workflow_dispatch only (no check-release gate, no sibling jobs)
+#   2. AMDGPU_TARGETS defaults to gfx1201 alone instead of the 20-target list
+#   3. tests are built so test-backend-ops ends up in the artifact
+#
+# Run it once per branch (f711-base, f711-rdna) and compare the two artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_targets:
+        description: "AMDGPU_TARGETS (semicolon-separated)"
+        required: false
+        default: "gfx1201"
+      rocm_version:
+        description: "ROCm version"
+        required: false
+        default: "7.14.0"
+
+jobs:
+  windows-rocm:
+    runs-on: windows-2022
+
+    env:
+      ROCM_VERSION: ${{ inputs.rocm_version }}
+      GPU_TARGETS: ${{ inputs.gpu_targets }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: f711-rocm-${{ env.ROCM_VERSION }}-x64
+          evict-old-files: 7d
+
+      - name: Setup ROCm
+        uses: ./.github/actions/windows-setup-rocm
+        with:
+          version: ${{ env.ROCM_VERSION }}
+
+      - name: Setup ROCm Environment
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+
+          $rocmPath = (rocm-sdk path --root)
+          if (-not $rocmPath) { throw "rocm-sdk path --root returned empty - devel package may not be installed" }
+          $rocmPath = $rocmPath.Trim()
+          $cmakePath = (rocm-sdk path --cmake).Trim()
+          $binPath = (rocm-sdk path --bin).Trim()
+          write-host "ROCm root: $rocmPath"
+          write-host "CMake path: $cmakePath"
+          write-host "Bin path: $binPath"
+
+          echo "HIP_PATH=$rocmPath" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$cmakePath" >> $env:GITHUB_ENV
+          echo "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          echo "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          echo "LLVM_PATH=$rocmPath\lib\llvm" >> $env:GITHUB_ENV
+          echo "$binPath" >> $env:GITHUB_PATH
+
+          echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
+
+      - name: Build
+        run: |
+          mkdir build
+          cd build
+          cmake .. `
+            -G "Unix Makefiles" `
+            -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_HIP=ON `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_C_FLAGS="-Wno-error=incompatible-pointer-types" `
+            -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DHIP_PATH="${env:HIP_PATH}" `
+            -DGGML_HIP_ROCWMMA_FATTN=ON `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_TESTS=ON `
+            -DAMDGPU_TARGETS="${env:GPU_TARGETS}"
+          cmake --build . --config Release --parallel ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Verify HIP backend was built
+        run: |
+          $hipDll = Get-ChildItem -Path build\bin -Filter "ggml-hip*.dll" -ErrorAction SilentlyContinue
+          if (-not $hipDll) {
+            Write-Host "##[error]ggml-hip*.dll was NOT produced. The HIP backend silently failed to build."
+            Write-Host "Contents of build\bin:"
+            Get-ChildItem build\bin | Format-Table -AutoSize
+            exit 1
+          }
+          Write-Host "HIP backend artifact found:"
+          $hipDll | Format-Table FullName, Length -AutoSize
+
+          $tbo = Get-ChildItem -Path build\bin -Filter "test-backend-ops*" -ErrorAction SilentlyContinue
+          if (-not $tbo) {
+            Write-Host "##[warning]test-backend-ops was NOT produced - correctness gate cannot run from this artifact."
+          }
+
+      - name: Record build provenance
+        run: |
+          $sha = "${{ github.sha }}"
+          $branch = "${{ github.ref_name }}"
+          @(
+            "branch=$branch",
+            "sha=$sha",
+            "rocm=${{ env.ROCM_VERSION }}",
+            "gpu_targets=${{ env.GPU_TARGETS }}",
+            "built=$(Get-Date -Format o)"
+          ) | Set-Content build\bin\BUILD-INFO.txt
+          Get-Content build\bin\BUILD-INFO.txt
+
+      - name: Pack artifacts
+        run: |
+          $short = "${{ github.sha }}".Substring(0,9)
+          $branch = "${{ github.ref_name }}"
+          $name = "llama-bin-win-rocm-f711-$branch-$short-x64.zip"
+          echo "ZIP_NAME=$name" >> $env:GITHUB_ENV
+          cp "LICENSE" "build\bin\"
+          7z a -snl $name .\build\bin\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: ${{ env.ZIP_NAME }}
+          name: ${{ env.ZIP_NAME }}
+          retention-days: 30
