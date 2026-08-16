@@ -17,6 +17,76 @@
 
 </div>
 
+## About this fork
+
+This is an **experimental fork** built for one specific purpose: serving a Qwen3.6-27B
+dense hybrid SSM/attention model ("f711") and a Qwen3.8-27B vision model in production
+on an **AMD Radeon AI PRO R9700** (32 GB, gfx1201/RDNA4) via ROCm/HIP, driving
+[Claude Code](https://github.com/anthropics/claude-code) through the `/v1/messages`
+endpoint.
+
+It combines two upstream sources:
+
+1. [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — upstream, tracked
+   close to `master`.
+2. [stew675/llama.cpp:rdna-boosts](https://github.com/stew675/llama.cpp/tree/rdna-boosts) —
+   a set of RDNA-specific kernel fusions (`MUL_MAT`, `FLASH_ATTN_EXT`, `RMS_NORM`,
+   `MUL`) ported on top of (1).
+
+...plus a single-target CI workflow (`.github/workflows/f711-rocm.yml`, ROCm 7.14,
+`AMDGPU_TARGETS=gfx1201` only) so a build finishes in minutes instead of covering
+every GPU target upstream CI builds for.
+
+### Why
+
+Upstream `llama.cpp` on this GPU/architecture combination (gfx1201/RDNA4, a dense
+Qwen3.5/3.6-family hybrid SSM+attention model) left a lot of prefill throughput on
+the table. `rdna-boosts` closes most of that gap. Before deploying it we ran two
+independent correctness gates (not just a speed benchmark): `test-backend-ops` on
+every op the branch touches, and a perplexity/code-quality comparison against a
+control build differing only by those commits — see [Results](#results) below.
+
+### Results
+
+Measured on production hardware, 15–16 Aug 2026. **Hardware:** AMD Radeon AI PRO
+R9700 (32 GB VRAM, gfx1201/RDNA4), ROCm 7.14. **Model:** f711-AMD-Q6_K
+(Qwen3.6-27B, dense, `n_expert = 0`, hybrid SSM/gated-delta-net + MTP head).
+
+**Speed** — real 100k-token prompt, production `-c 131072`:
+
+| ctx | arm | prefill | TTFT | gen | shared VRAM (spill) |
+|---|---|---|---|---|---|
+| 131072 | base | 312.4 t/s | 5m22s | 18.4 t/s | 242 MiB |
+| 131072 | **rdna-boosts** | **573.9 t/s (+84%)** | **2m55s** | 18.5 t/s | 244 MiB |
+| 147456 | base | *collapses* (>10 min) | — | — | 768 MiB (over the spill threshold) |
+| 147456 | **rdna-boosts** | **519.6 t/s** | 3m13s | 18.6 t/s | 542 MiB (still under threshold) |
+
+`rdna-boosts` is also more VRAM-efficient at high context — it raises the
+spill-collapse threshold instead of only being faster at the same one.
+
+**Correctness / quality:**
+
+- `test-backend-ops` on the ops the branch changes: **1194/1194** (`MUL_MAT`) and
+  **4552/4552** (`FLASH_ATTN_EXT`) passing on gfx1201.
+- Perplexity, production config (`-fa on`, fusions on): base **2.6898** →
+  rdna-boosts **2.6992** (+0.35%). Bisection isolated the cause to one commit,
+  `6e478a115` ("fuse IMRoPE + set-rows for BF16 KV cache"), which mis-fires on
+  plain f16 KV cache where it shouldn't apply — reported upstream, kept deployed
+  anyway since it doesn't regress generated-code quality and the speed win is
+  large. As an independent cross-check, the same model on the **Vulkan** backend
+  (which shares none of these kernels) measures PPL **2.7124** — i.e. the
+  base→rdna-boosts gap is smaller than the ordinary HIP↔Vulkan backend gap.
+- Code-generation quality benchmark (21 runs: generate C#/.NET code, `dotnet build`
+  + regex assertions against a pre-validated skeleton): base 16/21 build-ok /
+  98.3% asserts vs. rdna-boosts 15/21 / 99.2% asserts — no measurable regression
+  (the one-build difference is within run-to-run noise at temperature 0.7).
+
+**Status:** deployed in production since 16 Aug 2026 (branch `f711-rdna`, build tag
+`rdna-20260815`), serving both models above. Two later upstream commits from the
+same branch (`1b009339e`, `7955770b2`) were evaluated on 16 Aug and **not**
+deployed — correct, but no measurable speed gain (−0.33%, within noise) on this
+model/GPU; not worth the extra rebase-conflict surface.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
