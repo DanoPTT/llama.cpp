@@ -1912,7 +1912,11 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const s
     return it_best;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+server_prompt_cache_load_result server_prompt_cache::load(server_prompt &       prompt,
+                                                          const server_tokens & tokens_new,
+                                                          llama_context *       ctx_tgt,
+                                                          llama_context *       ctx_dft,
+                                                          int32_t               id_slot) {
     auto it_best = find(prompt, tokens_new);
 
     if (it_best != states.end()) {
@@ -1926,7 +1930,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
-                return false;
+                return SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED;
             }
 
             recycle(std::move(data));
@@ -1944,7 +1948,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
-                    return false;
+                    return SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED;
                 }
 
                 recycle(std::move(data));
@@ -1955,9 +1959,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        return SERVER_PROMPT_CACHE_LOAD_RESULT_RESTORED;
     }
 
-    return true;
+    return SERVER_PROMPT_CACHE_LOAD_RESULT_NO_MATCH;
 }
 
 void server_prompt_cache::update() {

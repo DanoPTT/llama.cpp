@@ -368,9 +368,9 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
-        if (!res) {
+    server_prompt_cache_load_result prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        const auto res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        if (res == SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
@@ -1865,6 +1865,7 @@ private:
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
+        bool selected_by_lru = false;
         bool update_cache = false;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
@@ -1941,6 +1942,7 @@ private:
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
+                selected_by_lru = true;
                 update_cache = true;
             }
         }
@@ -1950,6 +1952,11 @@ private:
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
+
+            // an LRU-selected slot is a victim, not a verified cache hit
+            if (selected_by_lru && !prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+                ret->prompt_clear();
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -1970,7 +1977,14 @@ private:
 
                 prompt_cache->states.splice(prompt_cache->states.end(), held);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens) && !prompt_load_with_room(*ret, task.tokens)) {
+                auto load_result = ret->prompt_load(*prompt_cache, task.tokens);
+
+                if (load_result == SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED && prompt_load_with_room(*ret, task.tokens)) {
+                    load_result = SERVER_PROMPT_CACHE_LOAD_RESULT_RESTORED;
+                }
+
+                if (load_result == SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED ||
+                    (selected_by_lru && load_result == SERVER_PROMPT_CACHE_LOAD_RESULT_NO_MATCH)) {
                     ret->prompt_clear();
                 }
 
@@ -2002,7 +2016,7 @@ private:
                 return false;
             }
             SLT_INF(slot, "%s", "retrying the prompt cache restore\n");
-            if (slot.prompt_load(*prompt_cache, tokens)) {
+            if (slot.prompt_load(*prompt_cache, tokens) != SERVER_PROMPT_CACHE_LOAD_RESULT_FAILED) {
                 return true;
             }
         }
