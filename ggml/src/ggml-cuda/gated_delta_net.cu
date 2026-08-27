@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -285,6 +286,33 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+
+    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
+    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
+    // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
+    // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
+    // The fused GDN->cpy (cache != nullptr) is honoured for K == 1: the chunked kernel writes
+    // its new state directly into the cache slot, so the cpy node can be skipped.
+    if ((cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            // GGML_CUDA_GDN_CHUNKED_BF16=0 opts OUT of the bf16/WMMA tensor-core path; it is
+            // the DEFAULT for S_v == 128 on the HIP build (near-lossless: PPL +0.056%, KL
+            // 0.0036 on wikitext-2 vs the fp32 path; not bit-exact). Everything else keeps
+            // the fp32 chunked path.
+            float * state_d_ext = cache ? cache->data : nullptr;
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+            if (S_v == 128 && (envb == nullptr || strcmp(envb, "0") != 0)) {
+                ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
+                return;
+            }
+#endif
+            ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext);
+            return;
+        }
+    }
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
