@@ -81,11 +81,52 @@ spill-collapse threshold instead of only being faster at the same one.
   98.3% asserts vs. rdna-boosts 15/21 / 99.2% asserts — no measurable regression
   (the one-build difference is within run-to-run noise at temperature 0.7).
 
-**Status:** deployed in production since 16 Aug 2026 (branch `f711-rdna`, build tag
-`rdna-20260815`), serving both models above. Two later upstream commits from the
-same branch (`1b009339e`, `7955770b2`) were evaluated on 16 Aug and **not**
-deployed — correct, but no measurable speed gain (−0.33%, within noise) on this
-model/GPU; not worth the extra rebase-conflict surface.
+**Status:** deployed in production since 16 Aug 2026, serving both models above.
+Current branch `f711-rdna-b10665-chatfix` (rebased onto upstream `b10665` on
+28 Aug 2026); the original deployment was `f711-rdna` / build tag `rdna-20260815`.
+Two later upstream commits from the same `rdna-boosts` branch (`1b009339e`,
+`7955770b2`) were evaluated on 16 Aug and **not** deployed — correct, but no
+measurable speed gain (−0.33%, within noise) on this model/GPU; not worth the
+extra rebase-conflict surface.
+
+### Rebasing onto upstream
+
+The stack is re-validated on every rebase rather than assumed neutral. The
+`b10488` → `b10665` rebase (177 upstream commits, 28 Aug 2026) is the reference
+example:
+
+- Three of our 28 commits were dropped: two had landed upstream (`#27679`,
+  `#27404`), and our `attn_gate` tensor-parallel granularity fix was superseded by
+  an upstream branch for `pattern_attn_gate_weight` that does the same thing.
+- One conflict needed a real merge: `ggml/src/ggml-cuda/rope.cu`, where upstream's
+  new `n_offs`/`inplace` (`ggml_rope_set_offset`) meets our `D`-cast output plus
+  ROPE+VIEW+SET_ROWS fusion in `rope_multi`. Resolved as a union of both, mirroring
+  `rope_neox` in the same file, which merged cleanly and already carries both.
+- Because that merge was hand-written, compiling was not treated as evidence.
+  Three gates, all on production hardware: perplexity unchanged on both models
+  (f711 2.6992, Qwen3.8 1.8577 — identical to the pre-rebase build), vision 3/3
+  assertions on both test images, and an interleaved 12-iteration speed A/B.
+- On the speed A/B: raw `gen_tps` is not readable on a build with an MTP draft
+  head. Draft acceptance swung 37.3–74.8% *within a single arm*, which is larger
+  than the difference between arms. Normalising to actual forward passes per
+  second — `gen_tps × (gen_tok − accepted) / gen_tok` — gives 9.78–9.89 across all
+  12 iterations with the arms overlapping, i.e. no change.
+
+### Note on the CI artifact
+
+`f711-rocm.yml` packs `build/bin` only. That is **not** a runnable ROCm tree: it
+lacks `rocblas.dll`, `hipblas.dll`, `rocsolver.dll`, `libhipblaslt.dll` and the
+Tensile kernel directories (`rocblas/library/`, `hipblaslt/library/gfx1201/`),
+without which `--list-devices` reports no device at all. We fill those in from a
+fixed reference tree after unpacking, which also keeps rocBLAS constant across
+measured arms.
+
+Upstream's release-job step from
+[#26973](https://github.com/ggml-org/llama.cpp/pull/26973) (bundling
+`amdhip64_7.dll`, `rocm_kpack.dll`, `amd_comgr.dll`) does **not** substitute for
+this — it addresses a different problem (the driver's HIP runtime in `System32`
+winning the loader search). It was ported here, measured, and reverted: with those
+DLLs bundled the artifact still enumerated no device.
 
 ## Quick start
 
