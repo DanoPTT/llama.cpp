@@ -93,7 +93,9 @@ extra rebase-conflict surface.
 
 The stack is re-validated on every rebase rather than assumed neutral. The
 `b10488` → `b10665` rebase (177 upstream commits, 28 Aug 2026) is the reference
-example:
+example — the full measurement record is in
+[docs/f711-r9700/rebase-b10665-2026-08-28.md](docs/f711-r9700/rebase-b10665-2026-08-28.md)
+(in Slovak):
 
 - Three of our 28 commits were dropped: two had landed upstream (`#27679`,
   `#27404`), and our `attn_gate` tensor-parallel granularity fix was superseded by
