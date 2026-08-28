@@ -129,30 +129,6 @@ jobs:
           ) | Set-Content build\bin\BUILD-INFO.txt
           Get-Content build\bin\BUILD-INFO.txt
 
-      - name: Bundle HIP runtime DLLs (amdhip64_7.dll, rocm_kpack.dll, amd_comgr.dll)
-        run: |
-          $ErrorActionPreference = "Stop"
-          # Ported from the upstream windows-rocm release job (PR #26973, issue #26929).
-          # ggml-hip.dll loads amdhip64_7.dll at run time. The Adrenalin driver ships its
-          # own amdhip64_7.dll in System32, which the loader searches before PATH, so a
-          # matching DLL from PATH cannot win. Copy amdhip64 next to the binaries (the exe
-          # directory is searched before System32). rocm_kpack.dll is amdhip64_7's direct
-          # dependency and amd_comgr is kept in sync to avoid a version mismatch.
-          # This replaces the local patch-rocm-runtime.ps1 post-download step.
-          $binPath = (rocm-sdk path --bin).Trim()
-          if (-not $binPath) { throw "rocm-sdk path --bin returned empty" }
-          write-host "ROCm bin path: $binPath"
-
-          $patterns = @("amdhip64_7.dll", "rocm_kpack.dll", "amd_comgr.dll")
-          foreach ($pattern in $patterns) {
-            $files = Get-ChildItem -Path $binPath -Filter $pattern -ErrorAction SilentlyContinue
-            if (-not $files) { throw "no match for $pattern in $binPath" }
-            foreach ($f in $files) {
-              Copy-Item $f.FullName -Destination build\bin -Force
-              write-host "  copied $($f.Name)"
-            }
-          }
-
       - name: Pack artifacts
         run: |
           $short = "${{ github.sha }}".Substring(0,9)
