@@ -1137,13 +1137,14 @@ void launch_fattn(
             const int tiles_nwaves             = (ntiles_dst + max_blocks - 1) / max_blocks;
             const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-            if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                return true;
+            // Fork (af43ef7ef): na AMD WMMA uprednostni cele dlazdice pred stream-k,
+            // ked je mriezka dlazdic uz dost hlboka na nasytenie GPU.
+            GGML_UNUSED(DKQ);
+            bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+            if (amd_wmma_available(cc) && ntiles_dst >= 2*max_blocks && tiles_efficiency_percent >= 75) {
+                use_stream_k = false;
             }
-            if (amd_wmma_available(cc) && DKQ == 64) {
-                return true; // TODO better configuration
-            }
-            return tiles_efficiency_percent < 75;
+            return use_stream_k;
         };
 
         const int  max_blocks   = max_blocks_per_sm*nsm;
