@@ -1313,6 +1313,31 @@ void ggml_cuda_mul_mat_vec_q(
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
+        // DIAGNOSTIKA 7.9.2026: tieto dva asserty zhadzovali produkciu, ked do
+        // jedneho batchu prispeli prefillom oba sloty (-np 2 --kv-unified).
+        // Assert samotny nepovie, ktore z fuznych miest args postavilo, tak to
+        // vypiseme skor, nez sa proces zabije.
+        if ((ids && dst->ne[2] != 1) || (!ids && dst->ne[1] != 1)) {
+            GGML_LOG_ERROR("%s: FUSION SHAPE VIOLATION site=%d\n", __func__, fusion->site);
+            GGML_LOG_ERROR("  dst  '%s' op=%s ne=[%lld,%lld,%lld,%lld]\n",
+                dst->name, ggml_op_name(dst->op),
+                (long long) dst->ne[0], (long long) dst->ne[1],
+                (long long) dst->ne[2], (long long) dst->ne[3]);
+            GGML_LOG_ERROR("  src0 '%s' type=%s ne=[%lld,%lld,%lld,%lld]\n",
+                src0->name, ggml_type_name(src0->type),
+                (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[2], (long long) src0->ne[3]);
+            GGML_LOG_ERROR("  src1 '%s' ne=[%lld,%lld,%lld,%lld]  ids=%s\n",
+                src1->name,
+                (long long) src1->ne[0], (long long) src1->ne[1],
+                (long long) src1->ne[2], (long long) src1->ne[3],
+                ids ? ids->name : "(null)");
+            GGML_LOG_ERROR("  gate=%s dst_gate=%s x_bias=%s glu_op=%d\n",
+                fusion->gate      ? fusion->gate->name      : "(null)",
+                fusion->dst_gate  ? fusion->dst_gate->name  : "(null)",
+                fusion->x_bias    ? fusion->x_bias->name    : "(null)",
+                (int) fusion->glu_op);
+        }
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
