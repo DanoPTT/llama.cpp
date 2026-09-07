@@ -4281,6 +4281,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // the add reads the matmul output directly, or through the view
         ggml_tensor * mm_or_view = has_view ? cgraph->nodes[i + 1] : mm_node;
 
+        // The mmvq/mmvf fusion kernels are told to write into bias_node, but the
+        // shape checks below (and ggml_cuda_should_fuse_mul_mat_vec_*) look at
+        // mm_node. Without a view those are the same tensor. With one they are not:
+        // a reshape can move the tokens between dimensions, so a matmul that looks
+        // like a single-column GEMV (ne = [n,1,2]) can be paired with an add whose
+        // destination is ne = [n,2,1]. The kernels index the destination by ne[1]
+        // and ne[2] and assert on exactly this, which aborted the server whenever
+        // two sequences contributed to one batch (-np 2 --kv-unified, 7.9.2026).
+        // Require the destination to satisfy the same constraint the kernels assert.
+        if (has_view) {
+            const ggml_tensor * ids_node = mm_node->src[2];
+            if (( ids_node && bias_node->ne[2] != 1) ||
+                (!ids_node && bias_node->ne[1] != 1)) {
+                continue;
+            }
+        }
+
         ggml_tensor * bias_tensor = nullptr;
         if (bias_op == GGML_OP_ADD) {
             if (bias_node->src[0] == mm_or_view) {
