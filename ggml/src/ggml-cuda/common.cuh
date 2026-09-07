@@ -1697,6 +1697,13 @@ struct ggml_cuda_mm_fusion_args_host {
     // Index x_scale by the destination channel (token), not the source channel
     // (expert). Used for the MoE down x topk-weights fusion.
     bool x_scale_channel_dst = false;
+
+    // DIAGNOSTIKA (na device nejde): ktore fuzne miesto v ggml-cuda.cu tieto
+    // argumenty postavilo. Vypise sa, ked padnu tvarove asserty v mmvq.cu, a
+    // podla toho isteho cisla sa da miesto vypnut cez GGML_CUDA_FUSION_MASK.
+    // Zavedene 7.9.2026 pri hladani vinnika padu (mmvq.cu:1317).
+    int site = 0;
+
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };

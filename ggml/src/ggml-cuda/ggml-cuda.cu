@@ -3501,6 +3501,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Bitmaska fuznych miest, 1 bit na miesto (site 1 = bit 0). Default = vsetko
+// zapnute. Ako pri GGML_CUDA_DISABLE_FUSION (a NA ROZDIEL od
+// GGML_CUDA_DISABLE_GRAPHS) sa cita HODNOTA, takze masku treba zadat cislom.
+// Sluzi na zuzenie vinnika padu z 7.9.2026 bez toho, aby sa muselo prekladat
+// pre kazde miesto zvlast.
+//
+//   1  gate+glu+up so scale, MUL_MAT     -> dst = cgraph->nodes[glu_idx]
+//   2  gate+glu+up so scale, MUL_MAT_ID  -> dst = cgraph->nodes[glu_idx]
+//   3  gate+glu+up s biasom              -> dst = glu
+//   4  gate+glu+up bez biasu             -> dst = glu
+//   5  parove K/V mmvq (nas ef155539d)   -> dst = mm_a  (dst_gate = mid)
+//   6  mul_mat + scale/bias              -> dst = out_node
+//   7  mul_mat + topk-weights MUL        -> dst = mul_node
+//   8  mul_mat + bias                    -> dst = bias_node
+//   9  rms_norm -> mul -> Q8_1 quantize cache (ggml_cuda_op_rms_norm_q8_1);
+//      NEJDE cez fusion_data, preto sa v diagnostike nikdy neobjavi ako site=9 -
+//      da sa len vypnut maskou. Hypoteza H2 z plánu.
+//
+// Priklad: vsetko okrem parového K/V = 511 - 16 = 495.
+static bool ggml_cuda_fusion_site_enabled(int site) {
+    static const int mask = []() {
+        const char * s = getenv("GGML_CUDA_FUSION_MASK");
+        return s ? std::atoi(s) : ~0;
+    }();
+    return (mask >> (site - 1)) & 1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3549,7 +3576,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
                 if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
-                        node->ne[0] % QK8_1 == 0 && ggml_cuda_should_fuse_mul_mat_vec_q(n)) {
+                        node->ne[0] % QK8_1 == 0 && ggml_cuda_fusion_site_enabled(9) &&
+                        ggml_cuda_should_fuse_mul_mat_vec_q(n)) {
                     ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                     return 1;
                 }
@@ -3871,7 +3899,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_fusion_site_enabled(1) && ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    fusion_data.site = 1;
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3965,7 +3994,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_fusion_site_enabled(2) && ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    fusion_data.site = 2;
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -4028,7 +4058,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_fusion_site_enabled(3) && ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -4036,6 +4066,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                fusion_data.site = 3;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -4069,12 +4100,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_fusion_site_enabled(4) && ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                fusion_data.site = 4;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -4093,7 +4125,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // second matmul's destination. Only view/noop nodes may sit between the pair.
     if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
         ggml_tensor * mm_a = cgraph->nodes[i];
-        if ((mm_a->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_a)) {
+        if (ggml_cuda_fusion_site_enabled(5) && (mm_a->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm_a)) {
             for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8); ++j) {
                 ggml_tensor * mid = cgraph->nodes[j];
                 if (ggml_cuda_is_view_or_noop(mid)) {
@@ -4109,6 +4142,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate     = mid->src[0];
                 fusion_data.dst_gate = mid;
+                fusion_data.site     = 5;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_a->src[0], mm_a->src[1], mm_a->src[2], mm_a, &fusion_data);
                 return j - i;
             }
@@ -4190,7 +4224,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (ggml_cuda_fusion_site_enabled(6) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                fusion_data.site = 6;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -4225,11 +4260,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
                     weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
                     ggml_are_same_shape(mm_node, mul_node) &&
-                    ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                    ggml_cuda_fusion_site_enabled(7) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.x_scale             = weights;
                 fusion_data.x_scale_channel_dst = true;
 
+                fusion_data.site = 7;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                 return 1;
             }
@@ -4443,7 +4479,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (ggml_cuda_fusion_site_enabled(8) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            fusion_data.site = 8;
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = has_view ? 3 : 2;
