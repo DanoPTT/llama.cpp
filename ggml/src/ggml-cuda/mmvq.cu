@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -1474,26 +1475,32 @@ void ggml_cuda_mul_mat_vec_q(
         // jedneho batchu prispeli prefillom oba sloty (-np 2 --kv-unified).
         // Assert samotny nepovie, ktore z fuznych miest args postavilo, tak to
         // vypiseme skor, nez sa proces zabije.
+        //
+        // PRIAMO DO stderr, NIE cez GGML_LOG_ERROR: common_log llama.cpp je
+        // asynchronny (vlastne vlakno + fronta) a abort() ho zabije skor, nez sa
+        // fronta vyprazdni - overene 7.9.2026, hlaska sa do logu vobec nedostala,
+        // hoci assert pod nou ano (ggml_abort pise do stderr priamo a flushuje).
         if ((ids && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) || (!ids && dst->ne[1] != 1)) {
-            GGML_LOG_ERROR("%s: FUSION SHAPE VIOLATION site=%d\n", __func__, fusion->site);
-            GGML_LOG_ERROR("  dst  '%s' op=%s ne=[%lld,%lld,%lld,%lld]\n",
+            fprintf(stderr, "%s: FUSION SHAPE VIOLATION site=%d\n", __func__, fusion->site);
+            fprintf(stderr, "  dst  '%s' op=%s ne=[%lld,%lld,%lld,%lld]\n",
                 dst->name, ggml_op_name(dst->op),
                 (long long) dst->ne[0], (long long) dst->ne[1],
                 (long long) dst->ne[2], (long long) dst->ne[3]);
-            GGML_LOG_ERROR("  src0 '%s' type=%s ne=[%lld,%lld,%lld,%lld]\n",
+            fprintf(stderr, "  src0 '%s' type=%s ne=[%lld,%lld,%lld,%lld]\n",
                 src0->name, ggml_type_name(src0->type),
                 (long long) src0->ne[0], (long long) src0->ne[1],
                 (long long) src0->ne[2], (long long) src0->ne[3]);
-            GGML_LOG_ERROR("  src1 '%s' ne=[%lld,%lld,%lld,%lld]  ids=%s\n",
+            fprintf(stderr, "  src1 '%s' ne=[%lld,%lld,%lld,%lld]  ids=%s\n",
                 src1->name,
                 (long long) src1->ne[0], (long long) src1->ne[1],
                 (long long) src1->ne[2], (long long) src1->ne[3],
                 ids ? ids->name : "(null)");
-            GGML_LOG_ERROR("  gate=%s dst_gate=%s x_bias=%s glu_op=%d\n",
+            fprintf(stderr, "  gate=%s dst_gate=%s x_bias=%s glu_op=%d\n",
                 fusion->gate      ? fusion->gate->name      : "(null)",
                 fusion->dst_gate  ? fusion->dst_gate->name  : "(null)",
                 fusion->x_bias    ? fusion->x_bias->name    : "(null)",
                 (int) fusion->glu_op);
+            fflush(stderr);
         }
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
