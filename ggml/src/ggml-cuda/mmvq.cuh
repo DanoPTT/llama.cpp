@@ -17,12 +17,6 @@ void ggml_cuda_op_mul_mat_vec_q(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
-void ggml_cuda_op_ssm_gate_beta(
-    ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
-    const ggml_tensor * dt, const ggml_tensor * ssm_a,
-    ggml_tensor * dst_gate, ggml_tensor * dst_beta);
-
 void ggml_cuda_op_shexp_down_gate(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * w_down, const ggml_tensor * swiglu,
