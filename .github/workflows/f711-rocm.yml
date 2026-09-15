@@ -17,9 +17,9 @@ on:
         required: false
         default: "gfx1201"
       rocm_version:
-        description: "ROCm version"
+        description: "ROCm version (whl-next currently serves 10.0.0 only)"
         required: false
-        default: "7.14.0"
+        default: "10.0.0"
 
 jobs:
   windows-rocm:
