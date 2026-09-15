@@ -2,6 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "fattn-skip-census.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -2029,6 +2030,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 #endif // !defined(GGML_USE_MUSA)
     }
+
+    ggml_cuda_fa_skip_census(dst, DKQ, ncols1, ncols2, nbatch_fa, ctx.stream());
 
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
