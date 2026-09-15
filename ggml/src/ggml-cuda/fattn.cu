@@ -521,7 +521,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const char * wmma_256_env = getenv("GGML_CUDA_FA_WMMA_256");
     const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
     const int wmma_max_head = (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc)) ? 576 : 128;
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+    // Batch-width threshold for admitting head sizes > 128 to the WMMA path (llama.cpp #28867).
+    // Our port has used 8 since the #28102 hunks, upstream uses 16, and the MFMA branch above
+    // uses 64 for the same head size. #28867 reports ~20% of speculative-decode throughput on
+    // gfx1201 + qwen35 (head 256) riding on this threshold, with prefill insensitive to it.
+    // Default stays 8 so that an unset environment reproduces the production binary exactly;
+    // set GGML_CUDA_FA_WMMA_MINCOLS_256=64 to A/B the proposed fix without a rebuild.
+    const char * wmma_mincols_env = getenv("GGML_CUDA_FA_WMMA_MINCOLS_256");
+    const int wmma_mincols_256 = wmma_mincols_env != nullptr ? std::atoi(wmma_mincols_env) : 8;
+    const int wmma_mincols = Q->ne[0] <= 128 ? 8 : wmma_mincols_256;
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > wmma_mincols) {
         // The kernel instantiates logit_softcap only for heads 128/256/512.
         if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
             return BEST_FATTN_KERNEL_MMA_F16;
@@ -586,9 +595,64 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// #28867 census: with GGML_CUDA_FA_DISPATCH_LOG=1 every distinct
+// (DKQ, n_q, gqa_ratio, gqa_ratio_eff, kernel) tuple that is actually executed is printed
+// to stderr once, at most 64 of them. This is how we find out which kernel the MTP verify
+// batches take and where Q->ne[1]*gqa_ratio_eff lands - the reporter of #28867 could not
+// pin that down. Off by default, costs one relaxed bool test per FA node when off.
+static void ggml_cuda_fattn_dispatch_log(const ggml_tensor * dst, best_fattn_kernel kernel) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_FA_DISPATCH_LOG");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    const int gqa_ratio   = Q->ne[2] / K->ne[2];
+    const int ncols2_max  = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
+    int gqa_ratio_eff = 1;
+    while (gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+        gqa_ratio_eff *= 2;
+    }
+
+    const std::array<int64_t, 5> key = { Q->ne[0], Q->ne[1], (int64_t) gqa_ratio, (int64_t) gqa_ratio_eff, (int64_t) kernel };
+
+    static std::mutex mtx;
+    static std::vector<std::array<int64_t, 5>> seen;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.size() >= 64) {
+        return;
+    }
+    for (const auto & s : seen) {
+        if (s == key) {
+            return;
+        }
+    }
+    seen.push_back(key);
+
+    const char * name = "?";
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:    name = "NONE";    break;
+        case BEST_FATTN_KERNEL_TILE:    name = "TILE";    break;
+        case BEST_FATTN_KERNEL_VEC:     name = "VEC";     break;
+        case BEST_FATTN_KERNEL_MMA_F16: name = "MMA_F16"; break;
+    }
+
+    fprintf(stderr, "FA-DISPATCH: DKQ=%lld n_q=%lld gqa=%d gqa_eff=%d cols_eff=%lld kernel=%s\n",
+            (long long) Q->ne[0], (long long) Q->ne[1], gqa_ratio, gqa_ratio_eff,
+            (long long) (Q->ne[1] * gqa_ratio_eff), name);
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    ggml_cuda_fattn_dispatch_log(dst, kernel);
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
