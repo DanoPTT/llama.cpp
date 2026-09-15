@@ -578,6 +578,27 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+#if defined(AMD_WMMA_AVAILABLE)
+    // Port of PR #28943 (moristeven477-ship-it), adapted: the upstream patch wraps this in
+    // `if constexpr (!use_sparse)`, but sparse-FA (#27970, 8e93a9773) is not in this tree.
+    {
+        const int j_probe = fastmodulo(jt*ncols1 + ncols1 - 1, ne01);
+        if (mask_h && __half2float(mask_h[int64_t(j_probe)*stride_mask + k_VKQ_0]) == -INFINITY) {
+            // A finite probe keeps dense tiles on the normal path. Otherwise check every mask element.
+            bool has_unmasked = false;
+            for (int ij = threadIdx.y*warp_size + threadIdx.x; ij < ncols1*nbatch_fa; ij += nwarps*warp_size) {
+                const int i = ij % nbatch_fa;
+                const int j = fastmodulo(jt*ncols1 + ij/nbatch_fa, ne01);
+                if ((!oob_check || i < k_VKQ_sup) && __half2float(mask_h[int64_t(j)*stride_mask + k_VKQ_0 + i]) != -INFINITY) {
+                    has_unmasked = true;
+                }
+            }
+            if (!__syncthreads_or(has_unmasked)) {
+                return;
+            }
+        }
+    }
+#endif // defined(AMD_WMMA_AVAILABLE)
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
