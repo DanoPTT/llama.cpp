@@ -635,6 +635,12 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // find a cached state that is a better starting point than `prompt` for `tokens_new`
+    std::list<server_prompt_cache_state>::iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new);
+
+    // same check as find_better, without touching any state
+    bool has_better(const server_prompt & prompt, const server_tokens & tokens_new);
+
     server_prompt_cache_load_result load(server_prompt &       prompt,
                                          const server_tokens & tokens_new,
                                          llama_context *       ctx_tgt,
