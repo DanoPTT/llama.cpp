@@ -1912,6 +1912,10 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const s
     return it_best;
 }
 
+bool server_prompt_cache::has_better(const server_prompt & prompt, const server_tokens & tokens_new) {
+    return find(prompt, tokens_new) != states.end();
+}
+
 server_prompt_cache_load_result server_prompt_cache::load(server_prompt &       prompt,
                                                           const server_tokens & tokens_new,
                                                           llama_context *       ctx_tgt,
