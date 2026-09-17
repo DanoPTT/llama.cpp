@@ -731,6 +731,9 @@ struct server_prompt_cache {
     // the cached prompt that load() would restore for tokens_new into a slot holding prompt (states.end(): none)
     std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
+    // same check as find, without touching any state
+    bool has_better(const server_prompt & prompt, const server_tokens & tokens_new);
+
     server_prompt_cache_load_result load(server_prompt &       prompt,
                                          const server_tokens & tokens_new,
                                          llama_context *       ctx_tgt,
