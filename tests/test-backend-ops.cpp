@@ -7093,9 +7093,11 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    const int mask_pattern;
+    const bool mask_broadcast;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) + "," + VAR_TO_STR(mask_pattern) + "," + VAR_TO_STR(mask_broadcast);
     }
 
     double max_nmse_err() override {
@@ -7112,9 +7114,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int mask_pattern = 0, bool mask_broadcast = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_pattern(mask_pattern), mask_broadcast(mask_broadcast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7162,7 +7164,11 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, mask_broadcast ? GGML_PAD(nb, 64) : nb, 1, nr23[1]);
+            if (mask_broadcast) {
+                ggml_set_name(m, "m_storage");
+                m = ggml_view_4d(ctx, m, kv, nb, 1, 1, m->nb[1], m->nb[2], m->nb[3], 0);
+            }
             ggml_set_name(m, "m");
         }
 
@@ -7185,8 +7191,52 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m_storage") == 0) {
+                // Poison the backing storage outside the logical broadcast mask.
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (mask_pattern > 0) {
+                    std::vector<float> data(ggml_nelements(t), -INFINITY);
+                    for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                        if (mask_pattern == 5) {
+                            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                                if (i < t->ne[0]/3 || i >= 2*t->ne[0]/3) {
+                                    data[row*t->ne[0] + i] = 0.0f;
+                                }
+                            }
+                            if (row % t->ne[1] == 0) {
+                                const int64_t sequence = row / t->ne[1];
+                                data[row*t->ne[0] + 17 + (sequence % 2)*(t->ne[0]/4)] = 0.75f;
+                                data[row*t->ne[0] + t->ne[0] - 17] = -0.5f;
+                            }
+                            continue;
+                        }
+                        if (mask_pattern == 4 || (mask_pattern == 3 && row % t->ne[1] == 0)) {
+                            continue; // Fully masked queries with attention sinks.
+                        }
+                        if (mask_pattern == 2) {
+                            data[row*t->ne[0]] = 0.0f;
+                            if (row % t->ne[1] == 0) {
+                                const int64_t sequence = row / t->ne[1];
+                                const int64_t col = t->ne[0]/2 + 17 - (t->ne[3] > 1 && sequence % 2 == 0)*(t->ne[0]/4);
+                                data[row*t->ne[0] + col] = 0.75f;
+                            }
+                        } else {
+                            const bool tail_only = (mask_pattern == 1 || mask_pattern == 3) && (row / t->ne[1]) % 2 != 0;
+                            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                                if ((!tail_only && i < t->ne[0]/4) || i >= 3*t->ne[0]/4) {
+                                    data[row*t->ne[0] + i] = -0.25f;
+                                }
+                            }
+                        }
+                    }
+                    std::vector<ggml_fp16_t> data_f16(data.size());
+                    ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data.size());
+                    ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -10020,6 +10070,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
+
+    // Packed mask classes (#28943 V2): broadcast one logical mask; backing storage also covers partial query tiles.
+    for (int64_t hs : {64, 128, 256}) {
+        for (int64_t nb : {1, 17, 64}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 2}, 512, nb, true, false, 0, 0,
+                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 1, true));
+        }
+    }
+
+    // Zero tiles, interior holes, and isolated finite biases cross packed-word boundaries.
+    for (int64_t hs : {64, 128, 256}) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 2}, 2048, 17, true, false, 0, 0,
+                                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 5));
+    }
+
+    // Masked interior tiles, one visible element in an otherwise masked tile, and fully masked queries with sinks.
+    for (int64_t hs : {64, 128, 256}) {
+        for (int mask_pattern : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 2}, 512, 17, true, mask_pattern >= 3, 0, 0,
+                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, mask_pattern));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 64, true, false, 0, 0,
+                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
