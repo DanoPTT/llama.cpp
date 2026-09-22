@@ -19,7 +19,10 @@ on:
       rocm_version:
         description: "ROCm version"
         required: false
-        default: "7.14.0"
+        # AMD's whl-next index serves only 10.0.0; 7.14.0 fails in Setup ROCm with
+        # "Could not find a version that satisfies the requirement rocm==7.14.0".
+        # This is also the version the production binaries are built against.
+        default: "10.0.0"
 
 jobs:
   windows-rocm:
