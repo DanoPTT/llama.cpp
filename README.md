@@ -83,8 +83,8 @@ spill-collapse threshold instead of only being faster at the same one.
   (the one-build difference is within run-to-run noise at temperature 0.7).
 
 **Status:** deployed in production since 16 Aug 2026, serving both models above.
-The current default branch is `f711-rdna-b10665-stack0911-nossm-maskskipv2-cachefix`
-(still based on upstream `b10665`; see [Changes since the b10665 rebase](#changes-since-the-b10665-rebase)).
+The branch currently in production, and the default branch, is
+`f711-rdna-b10665-stack0911-nossm-maskskipv2-cachefix` (still based on upstream `b10665`; see [Changes since the b10665 rebase](#changes-since-the-b10665-rebase)).
 Earlier stages: `f711-rdna-b10665-chatfix` (rebased onto `b10665` on 28 Aug 2026)
 and the original deployment `f711-rdna` / build tag `rdna-20260815`.
 Two later upstream commits from the same `rdna-boosts` branch (`1b009339e`,
