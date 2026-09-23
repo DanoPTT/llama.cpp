@@ -578,6 +578,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
 #endif // defined(AMD_WMMA_AVAILABLE)
 
+#if defined(AMD_WMMA_AVAILABLE)
+    // For large head dims K/V are read straight from global memory, which has no bounds check.
+    // A partial KV block (oob_check) is staged through LDS instead, where rows past k_VKQ_sup are zero-filled.
+    constexpr bool KV_direct = DKQ > 128 && !oob_check;
+#endif // defined(AMD_WMMA_AVAILABLE)
+
     const int k_VKQ_0 = kb0 * nbatch_fa;
     const bool use_mask = !skip_mask && (ncols2 > 1 || mask_h);
 #if defined(TURING_MMA_AVAILABLE)
@@ -605,7 +611,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 #if defined(AMD_WMMA_AVAILABLE)
         // For large head dims, K/V bypass LDS staging below so sync mask here.
-        if (DKQ > 128 && use_mask) {
+        if (KV_direct && use_mask) {
             __syncthreads();
         }
 #endif // AMD_WMMA_AVAILABLE
@@ -620,7 +626,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
 #if defined(AMD_WMMA_AVAILABLE)
-            if (DKQ <= 128) {
+            if (!KV_direct) {
 #endif // AMD_WMMA_AVAILABLE
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -645,7 +651,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 for (int k_KQ_0 = k0_start; k_KQ_0 < k0_stop; k_KQ_0 += T_A_KQ::J) {
                     T_A_KQ K_A;
 #if defined(AMD_WMMA_AVAILABLE)
-                    if (DKQ > 128) {
+                    if (KV_direct) {
                         load_ldmatrix(K_A, K_h2 + int64_t(k_VKQ_0 + i_KQ_0)*stride_K + k_KQ_0, stride_K);
                     } else
 #endif // AMD_WMMA_AVAILABLE
@@ -676,7 +682,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
                     T_A_KQ K_A;
 #if defined(AMD_WMMA_AVAILABLE)
-                    if (DKQ > 128) {
+                    if (KV_direct) {
                         load_ldmatrix(K_A, K_h2 + int64_t(k_VKQ_0 + i_KQ_0)*stride_K + k_KQ_0, stride_K);
                     } else
 #endif // AMD_WMMA_AVAILABLE
@@ -700,7 +706,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
 #if defined(AMD_WMMA_AVAILABLE)
-            if (DKQ <= 128)
+            if (!KV_direct)
 #endif // AMD_WMMA_AVAILABLE
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
@@ -992,7 +998,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int i0_diff = i0_stop - i0_start;
 #if defined(AMD_WMMA_AVAILABLE)
-            if (DKQ <= 128) {
+            if (!KV_direct) {
 #endif // AMD_WMMA_AVAILABLE
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
@@ -1010,7 +1016,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // AMD_WMMA_AVAILABLE
         }
 #if defined(AMD_WMMA_AVAILABLE)
-        const half2 * tile_V_i = DKQ > 128 ?
+        const half2 * tile_V_i = KV_direct ?
             V_h2 + int64_t(k_VKQ_0)*stride_V + i0_start/2 :
             (!V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2);
 #else
@@ -1027,7 +1033,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
                 T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
 #if defined(AMD_WMMA_AVAILABLE)
-                if (DKQ > 128) {
+                if (KV_direct) {
                     load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_V + (i_VKQ_0 - i0_start)/2, stride_V);
                 } else
 #endif // AMD_WMMA_AVAILABLE
@@ -1065,11 +1071,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
 #if defined(AMD_WMMA_AVAILABLE)
-            // When DKQ > 128, K/V bypass LDS so tile_K/tile_V barriers are unnecessary.
+            // When K/V bypass LDS (KV_direct), tile_K/tile_V barriers are unnecessary.
             // However, tile_mask still lives in LDS — the next iteration's load_mask
             // would overwrite it while a slow warp might still be reading it in softmax.
             // Keep the barrier when mask is active to prevent this WAR hazard.
-            if (DKQ <= 128 || ncols2 > 1 || mask_h)
+            if (!KV_direct || ncols2 > 1 || mask_h)
 #endif // AMD_WMMA_AVAILABLE
             __syncthreads(); // Needed if tile_K == tile_V, or if tile_mask is in use.
         }
@@ -1350,15 +1356,27 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
         const bool skip_mask = block_type == 2;
         constexpr bool last_iter = false;
-        constexpr bool oob_check = ncols2 == 1;
         for (; kb0 < run_stop; ++kb0) {
-            const int k_VKQ_sup = oob_check ? min(nbatch_fa, ne11 - kb0*nbatch_fa) : nbatch_fa;
-            flash_attn_ext_f16_iter
-                <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
-                 T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
-                (Q_f2, K_h2, V_h2, mask_h, skip_mask, dstk, dstk_fixup, scale, slope, logit_softcap,
-                 ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+            // Only a partial KV block needs the bounds-checked path. The GQA dispatch requires
+            // K->ne[1] % FATTN_KQ_STRIDE == 0, so in practice this is only reached with ncols2 == 1.
+            const int k_VKQ_sup = min(nbatch_fa, ne11 - kb0*nbatch_fa);
+            if (k_VKQ_sup < nbatch_fa) {
+                constexpr bool oob_check = true;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_f2, K_h2, V_h2, mask_h, skip_mask, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+            } else {
+                constexpr bool oob_check = false;
+                flash_attn_ext_f16_iter
+                    <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
+                     T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
+                    (Q_f2, K_h2, V_h2, mask_h, skip_mask, dstk, dstk_fixup, scale, slope, logit_softcap,
+                     ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
+                     KQ_max, KQ_rowsum, jt, kb0, nbatch_fa);
+            }
         }
     }
 #else

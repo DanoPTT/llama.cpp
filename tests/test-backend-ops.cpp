@@ -7095,9 +7095,14 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int mask_pattern;
     const bool mask_broadcast;
+    const bool kv_tail_nan; // fill the K/V cache rows past kv with NaN, so reading them poisons the result
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) + "," + VAR_TO_STR(mask_pattern) + "," + VAR_TO_STR(mask_broadcast);
+        std::string s = VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) + "," + VAR_TO_STR(mask_pattern) + "," + VAR_TO_STR(mask_broadcast);
+        if (kv_tail_nan) {
+            s += "," + VAR_TO_STR(kv_tail_nan);
+        }
+        return s;
     }
 
     double max_nmse_err() override {
@@ -7114,15 +7119,18 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int mask_pattern = 0, bool mask_broadcast = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int mask_pattern = 0, bool mask_broadcast = false, bool kv_tail_nan = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_pattern(mask_pattern), mask_broadcast(mask_broadcast) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_pattern(mask_pattern), mask_broadcast(mask_broadcast),
+          kv_tail_nan(kv_tail_nan) {
+        GGML_ASSERT(!kv_tail_nan || (kv_view && !v_is_view_of_k && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
         const int64_t hsv_padded = GGML_PAD(hsv, ggml_blck_size(type_V));
 
-        auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool is_view) -> ggml_tensor * {
+        auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool is_view, const char * storage_name = nullptr) -> ggml_tensor * {
             int64_t ne[4] = {ne0, ne1, ne2, ne3};
             int64_t ne_perm[4];
             for (int i = 0; i < 4; ++i) {
@@ -7131,6 +7139,9 @@ struct test_flash_attn_ext : public test_case {
             ggml_tensor * t;
             if (is_view) {
                 ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
+                if (storage_name) {
+                    ggml_set_name(t0, storage_name);
+                }
                 t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
             } else {
                 t = ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
@@ -7144,7 +7155,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view, "k_storage"); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -7158,7 +7169,7 @@ struct test_flash_attn_ext : public test_case {
 
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view, "v_storage"); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -7191,6 +7202,11 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (kv_tail_nan && (strcmp(t->name, "k_storage") == 0 || strcmp(t->name, "v_storage") == 0)) {
+                // The k/v views are initialized after their storage and overwrite the rows below kv,
+                // so only the rows a correct kernel never reads are left as NaN.
+                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(NAN));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "m_storage") == 0) {
                 // Poison the backing storage outside the logical broadcast mask.
                 std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
@@ -10013,6 +10029,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    // KV lengths that end in a partial nbatch_fa block, with NaN in the cache rows past kv:
+    // a kernel that reads K/V beyond kv (e.g. the direct-from-global K/V loads for head sizes > 128 on AMD WMMA)
+    // turns the output into NaN even if it masks those rows out of the softmax.
+    for (int hs : { 128, 256, }) {
+        for (int kv : { 113, 300, }) {
+            for (int nb : { 1, 8, 32, 75, }) {
+                for (int nr2 : { 1, 4, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, true));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
