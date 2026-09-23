@@ -33,7 +33,8 @@ It combines two upstream sources:
    a set of RDNA-specific kernel fusions (`MUL_MAT`, `FLASH_ATTN_EXT`, `RMS_NORM`,
    `MUL`) ported on top of (1).
 
-...plus a single-target CI workflow (`.github/workflows/f711-rocm.yml`, ROCm 7.14,
+...plus a single-target CI workflow (`.github/workflows/f711-rocm.yml`, ROCm 10.0.0
+by default — 7.14 until Sep 2026, when AMD's `whl-next` index stopped serving it —
 `AMDGPU_TARGETS=gfx1201` only) so a build finishes in minutes instead of covering
 every GPU target upstream CI builds for.
 
@@ -82,12 +83,74 @@ spill-collapse threshold instead of only being faster at the same one.
   (the one-build difference is within run-to-run noise at temperature 0.7).
 
 **Status:** deployed in production since 16 Aug 2026, serving both models above.
-Current branch `f711-rdna-b10665-chatfix` (rebased onto upstream `b10665` on
-28 Aug 2026); the original deployment was `f711-rdna` / build tag `rdna-20260815`.
+The current default branch is `f711-rdna-b10665-stack0911-nossm-maskskipv2-cachefix`
+(still based on upstream `b10665`; see [Changes since the b10665 rebase](#changes-since-the-b10665-rebase)).
+Earlier stages: `f711-rdna-b10665-chatfix` (rebased onto `b10665` on 28 Aug 2026)
+and the original deployment `f711-rdna` / build tag `rdna-20260815`.
 Two later upstream commits from the same `rdna-boosts` branch (`1b009339e`,
 `7955770b2`) were evaluated on 16 Aug and **not** deployed — correct, but no
 measurable speed gain (−0.33%, within noise) on this model/GPU; not worth the
 extra rebase-conflict surface.
+
+### Changes since the b10665 rebase
+
+What the stack gained on top of `f711-rdna-b10665-chatfix` (30 Aug – 22 Sep 2026):
+
+**Flash attention on RDNA4 WMMA (head size 256)**
+
+- `a88da45de` / `0fe0e31eb`: K/V loads skip the LDS staging when `DKQ > 128`.
+  The follow-up fixes a `tile_mask` write-after-read race that this exposed
+  (reported in the #26419 review). `FLASH_ATTN_EXT` passed 2920/2920 on
+  gfx1201 in 5 consecutive runs.
+- `af43ef7ef`: prefer whole-tile FA grids over stream-k on AMD WMMA. At 1
+  block/SM, stream-k collapses to 32 blocks on the R9700, measured at
+  16.4 vs 27 TFLOPS (DKQ=DV=256, `-ub 512`). NVIDIA behaviour is unchanged.
+- `efbb900c0`: head-256 tuning from upstream #28102, adapted to our stack. Our
+  wider head-size gates (up to 576) are kept, and so is our own
+  `(256, 256, 64)` tuning.
+- `f8372c0c8`: packed mask classes in WMMA FA, a V2 port of upstream #28943 (not
+  merged upstream). A helper kernel classifies every (query tile, KV block) as
+  fully masked, all-zero or mixed. Fully masked runs are skipped, and all-zero
+  runs skip the mask load. Unlike the upstream `KV_max` helper, this also fires on
+  our production shape (`-ub 512 --kv-unified`). It replaces the earlier V1 port
+  (`e17236d92`, reverted in `404cf5282`), and `b11c1c90f` adds the V2 patch's
+  mask-pattern cases to `test-backend-ops`.
+
+**Correctness fixes**
+
+- `9c9d65afd`: fixes the 7 Sep 2026 production abort
+  `mmvq.cu: GGML_ASSERT(ids || dst->ne[1] == 1)`. The `mul_mat + add` fusion
+  through a view fired when the reshape moved tokens across dimensions. That
+  happened under `-np 2 --kv-unified` whenever both slots contributed prefill to
+  one batch. The fix was located with `e2bea2ccf` / `2c53c00ae`, which add
+  diagnostic-only fusion-site IDs, a `GGML_CUDA_FUSION_MASK` env var that
+  disables individual sites, and a diagnostic written unbuffered to stderr.
+- `814a00830`: reverts the fused SSM gate/beta projection kernel. It fired only at
+  batch width 1, so decode and speculative verify ran different math. It caused
+  80 vs 14 top-1 flips per 512 positions against the #28768 harness and gave no
+  measurable speed gain (the fused arm was 0.79% slower).
+- `0a124702e` (upstream #28068): the GDN q/k normalization now uses FLA's
+  `x * rsqrt(sum(x²) + eps)` instead of `x / max(‖x‖, eps)`.
+
+**Server**
+
+- `2acdede5c` (#27624): clear stale prompt, checkpoint and KV/recurrent state when
+  an LRU-selected slot is reused without a valid restored state.
+- `d54c21732` (port of #28992): consult the RAM prompt cache even when the
+  outgoing slot state is not worth saving. The server now looks up a
+  returning, evicted conversation in the cache instead of re-prefilling it.
+- `e1cf8d36b` (#28302): checkpoint min-step eviction runs only when the checkpoint
+  list is full, so short prompts keep their resume checkpoint on hybrid models.
+- `f5130b07a` (#28715): pass the draft model the correct position after an image
+  when speculating.
+
+**CI**
+
+- `7f47acfa8` / `f5b6a8e3a`: ROCm wheels now come from `whl-next`, and the default is
+  `rocm_version = 10.0.0`, which the production binaries are built against.
+
+A rebase onto upstream `b10930` is in progress on `f711-rdna-b10930-r0` and is not
+yet the default branch.
 
 ### Rebasing onto upstream
 
