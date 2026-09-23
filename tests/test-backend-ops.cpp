@@ -7123,7 +7123,8 @@ struct test_flash_attn_ext : public test_case {
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_pattern(mask_pattern), mask_broadcast(mask_broadcast),
           kv_tail_nan(kv_tail_nan) {
-        GGML_ASSERT(!kv_tail_nan || (kv_view && !v_is_view_of_k && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16));
+        GGML_ASSERT(!kv_tail_nan || (kv_view && !v_is_view_of_k && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 &&
+                                     permute == std::array<int32_t, 4>{0, 1, 2, 3}));
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7202,10 +7203,21 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (kv_tail_nan && (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0)) {
+                // already initialized through k_storage/v_storage: the view is not contiguous
+                // (rows kv..2*kv-1 of every head sit between the heads), so a flat write would miss rows
+                continue;
             } else if (kv_tail_nan && (strcmp(t->name, "k_storage") == 0 || strcmp(t->name, "v_storage") == 0)) {
-                // The k/v views are initialized after their storage and overwrite the rows below kv,
-                // so only the rows a correct kernel never reads are left as NaN.
-                std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(NAN));
+                // Rows below kv get finite values, the rows past kv (the tail of every head) NaN,
+                // so only the rows a correct kernel never reads are poisoned.
+                std::mt19937 rng(strcmp(t->name, "k_storage") == 0 ? 1234 : 4321);
+                std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                const int64_t kv_rows = t->ne[1]/2;
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+                    const int64_t i1 = (i / t->ne[0]) % t->ne[1];
+                    data[i] = ggml_fp32_to_fp16(i1 < kv_rows ? dist(rng) : NAN);
+                }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "m_storage") == 0) {
                 // Poison the backing storage outside the logical broadcast mask.
