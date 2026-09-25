@@ -174,6 +174,27 @@ static bool ggml_cuda_flash_attn_ext_has_mask(const ggml_tensor * dst) {
     return dst->src[3] != nullptr || dst->src[5] != nullptr;
 }
 
+// Llama-Frankenstein D: see ggml_cuda_fattn_band_wmma_ncols1.  Kernel selection and the ncols
+// dispatch below must agree, so both ask this.  Limited to what was measured: head 256, GQA ratio
+// in (4, 8] (folded into ncols2 = 8), q8_0 K/V (read natively, no whole-cache F16 pass).  f16 K/V
+// stays on the tile kernel: it is already DRAM-bound there (~615 GB/s on gfx1201) and measured
+// 11-25% slower on this path (v1), and it is the MTP draft context's cache type.
+static bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_tensor * dst, const bool gqa_opt) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const bool kv_ok = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+
+    return ggml_cuda_fattn_band_wmma_ncols1() != 0 && GGML_CUDA_CC_IS_RDNA4(cc) && amd_wmma_available(cc) &&
+        gqa_opt && Q->ne[1] <= 8 && Q->ne[3] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        gqa_ratio > 4 && gqa_ratio <= 8 && logit_softcap == 0.0f && kv_ok;
+}
+
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -203,6 +224,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (ggml_cuda_fattn_band_wmma_applies(cc, dst, use_gqa_opt)) {
+            if (ggml_cuda_fattn_band_wmma_ncols1() == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 8>(ctx, dst);
+            }
+            return;
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -735,6 +767,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
     const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
     const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+    // Llama-Frankenstein D: the whole decode/verify band (n_q = 1 included) on WMMA, opt-in.
+    if (ggml_cuda_fattn_band_wmma_applies(cc, dst, gqa_opt_applies)) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
     // kernel: decode (n_q = 1) never uses WMMA, so a WMMA verify batch would
     // produce different logits than decode (GREEDY-PURITY band invariant).

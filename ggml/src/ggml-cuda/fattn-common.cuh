@@ -1563,6 +1563,34 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Llama-Frankenstein D (experimental, opt-in): route the decode/verify band (n_q <= 8) on RDNA4
+// to the WMMA kernel with the whole GQA group folded into one block (ncols2 = 8), instead of the
+// tile kernel with ncols2 = 2, which fetches and dequantizes every K/V element once per head pair
+// (3x for GQA 6).  GGML_HIP_FA_BAND_WMMA selects ncols1 for the whole band: 2 or 4 (0/unset = off,
+// stock rdna-boosts behaviour).  One ncols1 for the whole band keeps a single kernel config, and
+// launch_fattn fixes the stream-k KV split per output tile (see there), so n_q = 1 and every verify
+// width reduce identically (GREEDY-PURITY band invariant).
+static inline int ggml_cuda_fattn_band_wmma_ncols1() {
+    static const int ncols1 = []() {
+        const char * env = getenv("GGML_HIP_FA_BAND_WMMA");
+        const int v = env ? atoi(env) : 0;
+        return v == 2 || v == 4 ? v : 0;
+    }();
+    return ncols1;
+}
+
+// Blocks per output tile in the band (the interleave period P, see launch_fattn).  0 = one block per
+// CU (nsm); GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not
+// depend on n_q or on the KV length, or decode and verify would split differently.
+static inline int ggml_cuda_fattn_band_wmma_split() {
+    static const int split = []() {
+        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
+        const int v = env ? atoi(env) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return split;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1853,7 +1881,27 @@ void launch_fattn(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        if(use_stream_k) {
+        // Llama-Frankenstein D: in the decode/verify band the KV of every output tile is split over a
+        // fixed number P of blocks that take the nbatch_fa-row KV iterations round-robin (block i
+        // processes iterations i, i+P, i+2P, ...; launched as gridDim = (ntiles_dst, P)), like the
+        // tile kernel's parallel_blocks.  P depends only on the occupancy and the head layout, never
+        // on n_q or on the KV length, so a given KV iteration always lands in the same block at the
+        // same position of its accumulation order: a longer KV (a verify batch that crossed a
+        // 256-row padding boundary) only appends iterations that are fully masked for the earlier
+        // query rows, which are exact no-ops (P == 0, max unchanged), and the uniform fixup combines
+        // the P partials in a fixed order.  (v2 split contiguously with k = f(n_q = 1) blocks, whose
+        // split points moved with the KV length and broke greedy purity at those boundaries.)
+        const bool band_wmma = Q->ne[1] <= 8 && Q->ne[3] == 1 && amd_wmma_available(cc) && ggml_cuda_fattn_band_wmma_ncols1() != 0;
+
+        if (band_wmma) {
+            // P = nsm: measured on gfx1201 (64 CUs, head 256, GQA 6, 4 KV heads) the verify cost is flat
+            // for P = 48..96 at kv 20K..200K and degrades below 32 or above 128.  The occupancy-derived
+            // max_blocks / ntiles_dst of v4 gave 64 for ncols1 = 2 but only 16 for ncols1 = 4 (2x slower).
+            const int split_env = ggml_cuda_fattn_band_wmma_split();
+            const int P         = split_env > 0 ? split_env : std::max(2, nsm);
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = P;
+        } else if(use_stream_k) {
             const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
             // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
             // Only do this if the occupancy loss from rounding is acceptable.
@@ -1869,8 +1917,9 @@ void launch_fattn(
             blocks_num.x = nblocks_stream_k;
         }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+        const int nblocks_total = blocks_num.x * blocks_num.y; // blocks_num.y > 1 only in the band
+        if (ntiles_dst % nblocks_total != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+            dst_tmp_meta.alloc((size_t(nblocks_total) * ncols * (2 + DV/2)));
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1962,9 +2011,10 @@ void launch_fattn(
     CUDA_CHECK(cudaGetLastError());
 
     if (stream_k) {
-        if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
+        const int nblocks_launched = (int)(blocks_num.x * blocks_num.y); // 2-D only in the band
+        if (nblocks_launched % ntiles_dst == 0 && nblocks_launched > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
-            const int nblocks_sk  = (int)blocks_num.x;
+            const int nblocks_sk  = nblocks_launched;
             const int bpt         = nblocks_sk / ntiles_dst;
 
             const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
@@ -1979,7 +2029,7 @@ void launch_fattn(
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
-        } else if (ntiles_dst % blocks_num.x != 0) {
+        } else if (ntiles_dst % nblocks_launched != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
 
