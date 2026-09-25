@@ -23,6 +23,10 @@ on:
         # "Could not find a version that satisfies the requirement rocm==7.14.0".
         # This is also the version the production binaries are built against.
         default: "10.0.0"
+      fa_all_quants:
+        description: "GGML_CUDA_FA_ALL_QUANTS (ON = FA instancie pre vsetky kombinacie typov K/V, napr. K f16 + V q8_0)"
+        required: false
+        default: "OFF"
 
 jobs:
   windows-rocm:
@@ -31,6 +35,7 @@ jobs:
     env:
       ROCM_VERSION: ${{ inputs.rocm_version }}
       GPU_TARGETS: ${{ inputs.gpu_targets }}
+      FA_ALL_QUANTS: ${{ inputs.fa_all_quants || 'OFF' }}
 
     steps:
       - name: Clone
@@ -96,6 +101,7 @@ jobs:
             -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
             -DHIP_PATH="${env:HIP_PATH}" `
             -DGGML_HIP_ROCWMMA_FATTN=ON `
+            -DGGML_CUDA_FA_ALL_QUANTS="${env:FA_ALL_QUANTS}" `
             -DLLAMA_BUILD_TOOLS=ON `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_TESTS=ON `
@@ -128,6 +134,7 @@ jobs:
             "sha=$sha",
             "rocm=${{ env.ROCM_VERSION }}",
             "gpu_targets=${{ env.GPU_TARGETS }}",
+            "fa_all_quants=${{ env.FA_ALL_QUANTS }}",
             "built=$(Get-Date -Format o)"
           ) | Set-Content build\bin\BUILD-INFO.txt
           Get-Content build\bin\BUILD-INFO.txt
