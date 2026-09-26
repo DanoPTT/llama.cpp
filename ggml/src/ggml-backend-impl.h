@@ -116,6 +116,23 @@ extern "C" {
         // can be called multiple times for the same tensor: the longest lifetime applies
         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
         void * user_data;
+        // the scheduler will run the graph in sub-graphs split at every eval-callback node, so a
+        // backend optimisation that relies on state living for one whole compute (e.g. eliding a
+        // producer's F32 output and re-reading it from a per-graph cache) must stand down
+        bool has_eval_callback;
+        // the *whole* scheduled graph.  graph_optimize is called per split, but a consumer of a
+        // tensor may live in another split (the per-compute activation cache does not span splits),
+        // so a backend optimisation that elides a producer's output must consult the whole graph to
+        // find every consumer.  NULL means the graph is not split (full_graph == the split graph).
+        const struct ggml_cgraph * full_graph;
+        // Two-pass mode used by the meta (tensor-split) backend.  The meta owns the whole graph, so
+        // the scheduler never calls a child backend's graph_optimize; the meta forwards it twice
+        // instead -- once over the whole graph before allocation (alloc-deps only) and once per
+        // per-device subgraph of simple tensors after allocation (markings only), because the marks
+        // must be keyed by the tensor pointers the child's compute actually sees.  Both default to
+        // false (the single-backend scheduler runs the complete pass in one call).
+        bool marks_only;
+        bool allocs_only;
     };
 
     struct ggml_backend_i {

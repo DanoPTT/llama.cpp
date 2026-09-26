@@ -958,6 +958,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
 
+    // skip FLASH_ATTN_QSA since the idx/mask tensors are too small to choose a backend based on them
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_QSA;
+
+    // skip INDEXER_TOPK since the cell map / mask tensors are too small to choose a backend based on them
+    allow = allow && tensor->op != GGML_OP_INDEXER_TOPK;
+
+    allow = allow && tensor->op != GGML_OP_INDEXER_SCORE;
+    allow = allow && tensor->op != GGML_OP_INDEXER_FILL;
+
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
@@ -1034,6 +1043,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
+// the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
+// view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
+static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
+    while (t != NULL) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            return t;
+        }
+        t = t->view_src;
+    }
+    return NULL;
+}
+
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
@@ -1050,6 +1071,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         if (tensor_backend_id != -1) {
             buft = sched->bufts[tensor_backend_id];
         }
+    }
+
+    if (buft != NULL && ggml_backend_buft_is_host(buft) && sched->n_copies <= 1 &&
+            ggml_backend_sched_graph_input(t) != NULL) {
+        // A graph input that lives in host memory is written by the host thread.  On a device
+        // that accepts host buffers (an APU with info.devices[].integrated set), the scheduler
+        // would otherwise let the compute backend read it in place: the next ubatch's
+        // set_inputs then races the in-flight compute and a torn value can turn an index into an
+        // out-of-bounds store (k_set_rows MEMORY_APERTURE_VIOLATION on gfx1151, and the #15034
+        // corrupted output before that).  Force the split-input copy so the device reads a
+        // stream-ordered device buffer.  Weights are unaffected: they are never
+        // GGML_TENSOR_FLAG_INPUT, so zero-copy host weights (the input embeddings) keep working.
+        // The view chain is resolved because an input can be reached only through a view - the
+        // recurrent-state copy, for one, is.
+        return false;
     }
 
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
@@ -1453,6 +1489,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         },
         /* .user_data     = */ &alloc_deps,
+        /* .has_eval_callback = */ sched->callback_eval != nullptr,
+        /* .full_graph    = */ graph,
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -1624,15 +1662,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // Reserve the graph and check whether this requires growing (reallocating) one of the buffers.
+        // The buffers are grow-only, so when the graph fits within the already-reserved space (e.g.
+        // alternating dense/sparse ubatches of the same prompt) the reserve only recomputes the tensor
+        // layout and re-points the tensors of this graph.  Skipping the synchronization is only safe
+        // when a single device stream fully orders the compute: the probe/no-sync path is validated
+        // for single-GPU inference (gfx1151 / gfx1100).  With more than one device (tensor/layer
+        // split) a previous graph's kernels may still be in flight on other devices when the
+        // re-point happens, which races cross-device (in-kernel spin / memory faults at multi-ubatch
+        // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
+        // synchronization (upstream behavior).  Count the non-CPU (async-capable) devices rather than
+        // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
+        // A Meta backend (tensor split) presents as a single META device here, but it wraps
+        // multiple real devices and drives them on separate device streams.  Counting it as one
+        // async device would wrongly allow the no-sync re-point below on a tensor-split scheduler
+        // and race the previous ubatch's per-device kernels (in-kernel spin / memory faults,
+        // reproduced on 3x R9700).  A Meta device is only ever created for >1 device, so treat it
+        // as multi-device.
+        int n_async_devices = 0;
+        bool multi_device = false;
         for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_META) {
+                multi_device = true;
+            } else if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_async_devices++;
+            }
         }
+        // Only when a buffer must actually be grown is a full synchronization needed regardless,
+        // because the re-allocation moves the addresses of tensors that an in-flight graph may still
+        // be using.
+        const bool buffers_grown = ggml_gallocr_reserve_n_probe(
+                sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (buffers_grown || n_async_devices > 1 || multi_device) {
+            // the re-allocation may cause the split inputs to be moved to a different address
+            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
-            return false;
+            if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+                return false;
+            }
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2108,6 +2180,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_QSA:
+        case GGML_OP_INDEXER_TOPK:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:
