@@ -791,7 +791,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
 #else
         const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 #endif // defined(GGML_USE_HIP)
 
         sumf += d8[i&1] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
