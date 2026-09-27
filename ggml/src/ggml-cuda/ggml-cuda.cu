@@ -4524,6 +4524,18 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count;
 }
 
+// The decode-only SSM fusions (gate/beta in ggml_cuda_try_fuse, and the SSM
+// pre-scan chain conv+l2+gate/beta) run only when the ubatch has one token, so a
+// decode step and an n-token verify/prefill of the same layer take different
+// kernels and the output depends on the batch width (ggml-org/llama.cpp#28768).
+// They are off by default in this fork; GGML_CUDA_SSM_DECODE_FUSION=1 turns them
+// back on for A/B.
+static bool ssm_decode_fusion_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_SSM_DECODE_FUSION") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_SSM_DECODE_FUSION"));
+    return enabled;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5654,7 +5666,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
     // Two small Q8_0 projections over the same input plus the gating chain, fused
     // into one kernel. Both outputs feed only the gated delta net kernel.
-    if (i + 8 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+    if (ssm_decode_fusion_enabled() && i + 8 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
         const ggml_op ops[9] = {
             GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
             GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY
@@ -5922,7 +5934,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta
     // projections (pattern built by qwen35moe, decode only). One kernel instead
     // of ssm_conv, l2_norm_pair and ssm_gate_beta.
-    if (node->op == GGML_OP_SSM_CONV && node->type == GGML_TYPE_F32 && node->ne[1] == 1 &&
+    if (ssm_decode_fusion_enabled() && node->op == GGML_OP_SSM_CONV && node->type == GGML_TYPE_F32 && node->ne[1] == 1 &&
             i + 15 < cgraph->n_nodes) {
         const ggml_tensor * silu     = cgraph->nodes[i + 1];
         const ggml_tensor * q_view   = cgraph->nodes[i + 2];
