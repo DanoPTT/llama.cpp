@@ -1246,6 +1246,18 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx, 
     return false;
 }
 
+// The decode-only SSM fusions (gate/beta in ggml_cuda_try_fuse, and the SSM
+// pre-scan chain conv+l2+gate/beta) run only when the ubatch has one token, so a
+// decode step and an n-token verify/prefill of the same layer take different
+// kernels and the output depends on the batch width (ggml-org/llama.cpp#28768).
+// They are off by default in this fork; GGML_CUDA_SSM_DECODE_FUSION=1 turns them
+// back on for A/B.
+static bool ssm_decode_fusion_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_SSM_DECODE_FUSION") != nullptr &&
+                                std::atoi(getenv("GGML_CUDA_SSM_DECODE_FUSION"));
+    return enabled;
+}
+
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -2059,7 +2071,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     // Two small Q8_0 projections over the same input plus the gating chain, fused
     // into one kernel. Both outputs feed only the gated delta net kernel.
     // SSM gate/beta verify-band fusion (owned by mmvq.cu).
-    if (const int n_gate_beta = ggml_cuda_gate_beta_verify_try_fuse(*cuda_ctx, cgraph, i)) {
+    if (const int n_gate_beta = ssm_decode_fusion_enabled() ? ggml_cuda_gate_beta_verify_try_fuse(*cuda_ctx, cgraph, i) : 0) {
         return n_gate_beta;
     }
 
@@ -2224,7 +2236,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     }
 
     // Fuse the SSM pre-scan chain (owned by mmvq.cu). GGML_CUDA_DISABLE_SSM_PRESCAN=1 turns it off.
-    if (const int n_ssm_prescan = ggml_cuda_ssm_prescan_try_fuse(*cuda_ctx, cgraph, i)) {
+    if (const int n_ssm_prescan = ssm_decode_fusion_enabled() ? ggml_cuda_ssm_prescan_try_fuse(*cuda_ctx, cgraph, i) : 0) {
         return n_ssm_prescan;
     }
 
