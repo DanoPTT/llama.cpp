@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -167,10 +168,81 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+// Choose the number of threads for a CPU graph compute.
+//
+// A very small CPU graph - typically the input/PLE embedding GET_ROWS (and a handful of
+// state copies) that the scheduler peels off the front of a GPU graph - gains nothing
+// from an OpenMP fork, and paying for it once per graph is actively harmful at the graph
+// rates speculative decoding reaches: every parallel region re-arms the runtime's active
+// wait (KMP_BLOCKTIME), so the idle workers spin instead of sleeping and a spec-decode
+// workload (n_max + 1 back-to-back graphs per token) pins every core for the whole run.
+// Run such graphs inline on the calling thread instead; a real (prefill-sized) gather or
+// any larger graph keeps the configured thread count.  Disable the heuristic with
+// GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1 for A/B and bisection.
+//
+// The "tiny" test counts the tensors the graph *reads*, not just its node outputs: a
+// CPU-offloaded FFN chunk is a handful of MUL_MAT nodes with ~16 KiB activation outputs
+// that each read tens of MiB of weights, so an output-only estimate serializes the weight
+// reads on one thread (issue #52: 8.7 -> 1.7 t/s).  GET_ROWS is the exception - its src0
+// is the (possibly huge) embedding table of which only the gathered rows are read - so
+// counting it would permanently disable the heuristic for the host-resident-embedding
+// case it exists for.
+static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
+    if (n_threads <= 1) {
+        return n_threads;
+    }
+
+    static const bool disabled = getenv("GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD") != nullptr;
+    if (disabled) {
+        return n_threads;
+    }
+
+    // bounds chosen so an ordinary model graph (CPU-only inference, or a large prefill
+    // gather on a CPU split) never qualifies; the split graphs this targets are 1-7 nodes
+    // of a few hundred KiB each
+    constexpr int    max_nodes = 32;
+    constexpr size_t max_bytes = 16ull*1024*1024;
+
+    if (cgraph->n_nodes > max_nodes) {
+        return n_threads;
+    }
+
+    size_t total_bytes = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_is_view(node)) {
+            total_bytes += ggml_nbytes(node);
+            if (total_bytes > max_bytes) {
+                return n_threads;
+            }
+        }
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+            // GET_ROWS only reads the gathered rows of its table (src0), which can be
+            // orders of magnitude larger than the bytes it actually touches
+            if (node->op == GGML_OP_GET_ROWS && j == 0) {
+                continue;
+            }
+            total_bytes += ggml_nbytes(src);
+            if (total_bytes > max_bytes) {
+                return n_threads;
+            }
+        }
+    }
+
+    return 1;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    const int n_threads = ggml_backend_cpu_graph_n_threads(cgraph, cpu_ctx->n_threads);
+
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -206,6 +278,12 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
+    /* .stage_buffer            = */ NULL,
+    /* .stage_upload            = */ NULL,
+    /* .stage_wait              = */ NULL,
+    /* .stage_d2d               = */ NULL,
+    /* .stage_h2d_gbps          = */ NULL,
+    /* .stage_input             = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

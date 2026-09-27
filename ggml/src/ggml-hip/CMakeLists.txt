@@ -61,9 +61,15 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# The 512-head flash-attn MMA instances are by far the longest single compiles (~130 s each);
+# list them first so make's FIFO dispatch starts them at t=0 instead of leaving them as the tail
+# of the build (the same as the generated per-head/per-type split -- this is build order only).
+file(GLOB   SRCS_FA_HEAVY "../ggml-cuda/template-instances/fattn-mma*-dkq512-*.cu")
+list(INSERT GGML_SOURCES_ROCM 0 ${SRCS_FA_HEAVY})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+list(REMOVE_ITEM SRCS ${SRCS_FA_HEAVY})
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -116,6 +122,17 @@ endif()
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
+
+# Silence the "loop not unrolled" flood from the FlashAttention kernels.
+# AMDGPU clang's loop-unroll pass reports every bare `#pragma unroll` it cannot
+# honour, and `fattn-mma-f16.cuh` has several on runtime-bounded loops (the
+# K/V staging loop and the sparse combine path).  That is upstream noise, but
+# the delivery's native-KV arms instantiate the whole WMMA kernel once per KV
+# type per instance TU, which multiplies it into ~10k warning lines per clean
+# build.  The pragmas are advisory hints, the pass already failed, and the code
+# is unaffected, so keep `-Wpass-failed` off for the HIP build only (the flag is
+# a Clang/AMDGPU one; the CUDA toolchains do not emit this diagnostic).
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-pass-failed")
 
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
