@@ -2958,12 +2958,19 @@ private:
 
         if (ckpt_reuse) {
             cur.data_tgt = ckpt_take(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-            if (ctx_dft) {
-                cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-            }
+            // no spare for data_dft: the draft context is not stored (below), and a spare
+            // taken here would leave stale bytes that load_dft() would then restore
         }
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // Do not store the draft context here. It is a plain prefix-addressed KV
+        // cache, the same kind of memory as the target's attention cache, which
+        // llama_memory_hybrid::state_write() already skips under PARTIAL_ONLY:
+        // its cells stay resident and a trimmed tail is rebuilt by replay.
+        // llama_kv_cache::state_write() ignores the flag (GGML_UNUSED(flags)), so
+        // passing it here serializes the whole draft KV into every checkpoint and
+        // makes the checkpoint's size linear in the context.
+        // Restoring needs no matching change: load_dft() returns early when
+        // data_dft is empty, so the draft memory is left untouched.
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
