@@ -695,7 +695,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 1
+#define VDR_Q6_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMVQ_MOE 2
 #define VDR_Q6_K_Q8_1_MMQ  8
 
