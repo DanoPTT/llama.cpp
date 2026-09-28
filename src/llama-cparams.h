@@ -14,6 +14,7 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    uint32_t n_rs_batch;      // largest per-seq batch that can be rolled back into (0 = n_rs_seq + 1)
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
@@ -39,6 +40,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
+    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
@@ -48,10 +51,15 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_hc_mix;       // use the fused hyper-connection mixer (qwen4exp decode)
+    bool fused_hc_combine;   // use the fused hyper-connection combine (qwen4exp decode)
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+
+    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
+    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
