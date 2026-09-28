@@ -3137,21 +3137,32 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 //   - MUL_MAT     -> result is [src0->ne[1], src1->ne[1], ...], so src1->ne[1] is n_tokens
 // The MUL_MAT arm requires a constant, unbatched weight (src0 is op NONE and 2-D) so the
 // probe reads a layer's activation batch; attention score matmuls are skipped.
-static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
 
         if (node->op == GGML_OP_MUL_MAT_ID) {
-            return node->ne[2] > 1;
+            return node->ne[2];
         }
         if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
             node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
-            return node->src[1]->ne[1] > 1;
+            return node->src[1]->ne[1];
         }
     }
 
     // No weight matmul found in this split: fall back to the first node's second dim.
-    return cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1;
+    return cgraph->n_nodes > 0 ? cgraph->nodes[0]->ne[1] : 0;
+}
+
+// Graphs that skip the CUDA/HIP graph path.  PRE-FILL ubatches vary in size, so capture never
+// amortizes there.  A spec-verify batch (W = 2..MMVQ_MAX_BATCH_SIZE) has the same shape every
+// step, like single-token decode, so it keeps graph replay: without it the verify graph pays
+// the host launch cost of every node on every step.
+// GGML_CUDA_DISABLE_VERIFY_GRAPHS=1 restores the old behaviour (all multi-token graphs skip).
+static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+    static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
+    const int64_t n_tokens = ggml_cuda_graph_n_tokens(cgraph);
+    return n_tokens > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
