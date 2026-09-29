@@ -493,6 +493,14 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // true when node_allocs/leaf_allocs describe a layout that the currently allocated buffers can
+    // actually hold.  Cleared when a reserve fails to allocate one of the buffers, because the
+    // layout has already been rewritten for the (larger) new graph while some of the buffers are
+    // still the old size or gone entirely -- reusing it would point tensors outside their buffer
+    // (ggml_backend_tensor_alloc's bounds assert) or at a NULL vbuffer.  Whenever it is false,
+    // ggml_gallocr_needs_realloc() forces the next allocation to go through a fresh reserve.
+    bool layout_valid;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -760,6 +768,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
     }
 
+    // a view node that is never used as a source keeps its view source's n_views count elevated
+    // forever: the free pass below only decrements that count when the view itself is released, which
+    // never happens for a node with no consumers (e.g. a ggml_cpy expanded into the graph purely for
+    // its side effect - the "copy into a view of preallocated memory" idiom). The inflated count
+    // blocks both the view source's release and its in-place reuse, so the buffer grows by the size of
+    // every such view source. Fold those contributions in here, while the child counts are final.
+    // Graph outputs are exempt: they are never freed and may alias the view source, which must stay
+    // allocated for the application to read it.
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+
+        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            continue;
+        }
+
+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+        if (hn->n_children != 0) {
+            continue;
+        }
+
+        struct ggml_tensor * view_src = node->view_src;
+        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+        view_src_hn->n_views -= 1;
+
+        AT_PRINTF("unused view %s: view_src %s: %d children, %d views\n",
+            node->name, view_src->name, view_src_hn->n_children, view_src_hn->n_views);
+
+        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+            ggml_gallocr_free_node(galloc, view_src);
+        }
+    }
+
     // allocate tensors
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -823,7 +866,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 }
 
 static bool ggml_gallocr_reserve_n_impl(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc, bool * buffers_grown) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -923,34 +966,51 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-#ifndef NDEBUG
-            {
-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-                }
+            if (buffers_grown != NULL) {
+                *buffers_grown = true;
             }
-#endif
-            ggml_vbuffer_free(galloc->buffers[i]);
+            const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            if (!no_alloc && cur_size > 0) {
+                // Growing an already-reserved compute buffer is rare (the reserve sizes for the
+                // worst-case graph) and is exactly what runs a nearly-full device out of memory, so
+                // keep the old size in the log at INFO level: this used to be a GGML_LOG_DEBUG inside
+                // `#ifndef NDEBUG`, so in a Release build a failed growth was unattributable.
+                GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                    __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+            }
             if (no_alloc) {
-                galloc->buffers[i] = NULL;
+                // sizing/probe path: leave the existing buffers untouched so that the layout can be
+                // computed (and whether a reallocation would be needed) without disturbing the memory
+                // of any in-flight graph
             } else {
+                // reallocate the buffers to fit the new layout; this moves the tensor addresses of the
+                // previous layout, so any work queued on the backends must have completed before calling
+                // this function in the case the buffers are grown
+                ggml_vbuffer_free(galloc->buffers[i]);
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // the layout was rewritten for this (larger) graph above, but this buffer is now
+                    // gone and the not-yet-processed ones still have their old size; invalidate it so
+                    // that a later ggml_gallocr_alloc_graph() cannot hand a tensor an address that
+                    // does not even fit its buffer (or a NULL vbuffer) -- it must reserve again.
+                    galloc->layout_valid = false;
                     return false;
                 }
             }
         }
     }
 
+    // the layout matches the buffers that are now allocated (for the no_alloc/probe path this is
+    // only true when nothing had to grow, which is what *buffers_grown reports)
+    galloc->layout_valid = !(buffers_grown != NULL && *buffers_grown);
+
     return true;
 }
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true, NULL));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
@@ -959,8 +1019,18 @@ void ggml_gallocr_reserve_n_size(
     }
 }
 
+// compute the layout of graph without modifying the existing buffers, and report whether the buffers
+// would need to be grown (reallocated) to hold it. the layout is stored regardless, so when this
+// returns false ggml_gallocr_alloc_graph can be called directly: only the tensor addresses change and
+// the compute of the graph is ordered after the compute of any previous graph on the backend streams.
+bool ggml_gallocr_reserve_n_probe(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    bool buffers_grown = false;
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true, &buffers_grown));
+    return buffers_grown;
+}
+
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
-    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, NULL);
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
@@ -1007,6 +1077,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (!galloc->layout_valid) {
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: layout is not valid (a previous reserve failed)\n", __func__);
+#endif
+        return true;
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
