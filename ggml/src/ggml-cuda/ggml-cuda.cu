@@ -4552,6 +4552,10 @@ static bool ssm_decode_fusion_enabled() {
 //   MMGLU  - gate + up + GLU folded into mmvq
 //   RMSMUL - rms_norm + mul and rms_norm + mul + add
 //   MMVQX  - the other mmvq epilogues: SSM conv-input concat, dual-output K/V pair, mul_mat + scale (+bias)
+//   RMSQ8  - rms_norm + mul folded into the mmvq Q8_1 quantize (ggml_cuda_op_rms_norm_q8_1)
+//   MMADD  - mul_mat (+reshape) + add / mul_mat_id + add_id epilogue
+//   NOFUSE      - every fusion off, like GGML_CUDA_DISABLE_FUSION=1, but the fusion alloc deps are kept
+//   NOALLOCDEPS - the fusion alloc deps dropped, like GGML_CUDA_DISABLE_FUSION=1, but the fusions stay on
 static bool ggml_cuda_dbg67_off(const char * name) {
     const char * v = getenv(name);
     return v != nullptr && atoi(v) != 0;
@@ -4561,6 +4565,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
+        return 0;
+    }
+    static const bool dbg67_nofuse = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_NOFUSE");
+    if (dbg67_nofuse) {
         return 0;
     }
 
@@ -4811,7 +4819,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
     // finds the cached blocks and skips its own quantize. The matmul need not
     // be adjacent (unrelated nodes may sit between in DFS order).
-    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+    static const bool dbg67_rmsq8 = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_RMSQ8");
+    if (!dbg67_rmsq8 && node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
         const ggml_tensor * mul = cgraph->nodes[i + 1];
         if (mul->op == GGML_OP_MUL && mul->src[0] == node) {
             // The consumers of the norm output are mostly mmvq matmuls; skip
@@ -5082,6 +5091,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     static const bool dbg67_mmglu  = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_MMGLU");
     static const bool dbg67_rmsmul = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_RMSMUL");
     static const bool dbg67_mmvqx  = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_MMVQX");
+    static const bool dbg67_mmadd  = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_MMADD");
 
     // SSM conv-input fusion: qkv_mixed MUL_MAT output feeds the last row of an
     // interleaved [conv_kernel_size, channels] conv input (via view nodes and a
@@ -5860,6 +5870,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // mul_mat + add, with an optional view (reshape) node between the matmul and the add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+        if (dbg67_mmadd) {
+            break;
+        }
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         // view (reshape) between the matmul and the add
@@ -7381,6 +7394,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+    static const bool dbg67_noallocdeps = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_NOALLOCDEPS");
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 
@@ -7395,7 +7409,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     };
 
-    if (!disable_fusion) {
+    if (!disable_fusion && !dbg67_noallocdeps) {
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
