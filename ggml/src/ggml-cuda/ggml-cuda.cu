@@ -4547,6 +4547,16 @@ static bool ssm_decode_fusion_enabled() {
     return enabled;
 }
 
+// DEBUG (stew675/llama-cpp-rdna-boosts#67): temporary kill switches for fusions that have none, to bisect
+// the cross-start greedy flip. Default off, behaviour unchanged. GGML_CUDA_DBG67_<NAME>=1 disables:
+//   MMGLU  - gate + up + GLU folded into mmvq
+//   RMSMUL - rms_norm + mul and rms_norm + mul + add
+//   MMVQX  - the other mmvq epilogues: SSM conv-input concat, dual-output K/V pair, mul_mat + scale (+bias)
+static bool ggml_cuda_dbg67_off(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5069,12 +5079,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
+    static const bool dbg67_mmglu  = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_MMGLU");
+    static const bool dbg67_rmsmul = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_RMSMUL");
+    static const bool dbg67_mmvqx  = ggml_cuda_dbg67_off("GGML_CUDA_DBG67_MMVQX");
+
     // SSM conv-input fusion: qkv_mixed MUL_MAT output feeds the last row of an
     // interleaved [conv_kernel_size, channels] conv input (via view nodes and a
     // dim-0 CONCAT). Fold the concat into the mmvq epilogue: the kernel writes
     // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
     // from the GET_ROWS output into conv_input[cs*c + k]. The CONCAT is skipped.
-    if (node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+    if (!dbg67_mmvqx && node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
         const int scan_end = std::min(cgraph->n_nodes, i + 8);
         for (int j = i + 1; j < scan_end; ++j) {
@@ -5189,6 +5203,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+        if (dbg67_mmglu) {
+            break;
+        }
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         if (op == GGML_OP_MUL_MAT) {
@@ -5523,7 +5540,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // same output shape (e.g. the K and V projections of an attention layer).
     // The first matmul computes both results; the gate result is written to the
     // second matmul's destination. Only view/noop nodes may sit between the pair.
-    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+    if (!dbg67_mmvqx && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
         ggml_tensor * mm_a = cgraph->nodes[i];
         if ((mm_a->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_a)) {
             for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8); ++j) {
@@ -5552,6 +5569,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+        if (dbg67_mmvqx) {
+            break;
+        }
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         for (const bool with_bias : { false, true }) {
@@ -5966,12 +5986,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+    if (!dbg67_rmsmul && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+    if (!dbg67_rmsmul && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
