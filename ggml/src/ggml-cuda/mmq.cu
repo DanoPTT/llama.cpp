@@ -195,7 +195,8 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(src0s[0]->ne[2] == src0s[1]->ne[2]);
 
     // ISOLATION HOOK: run the two muls through the ORIGINAL single-node path (no merge)
-    if (getenv("GGML_PAIR_2X") != nullptr) {
+    static const bool pair_2x = getenv("GGML_PAIR_2X") != nullptr;
+    if (pair_2x) {
         ggml_cuda_mul_mat_q(ctx, dst0->src[0], dst0->src[1], dst0->src[2], dst0, nullptr, nullptr);
         ggml_cuda_mul_mat_q(ctx, dst1->src[0], dst1->src[1], dst1->src[2], dst1, nullptr, nullptr);
         return;

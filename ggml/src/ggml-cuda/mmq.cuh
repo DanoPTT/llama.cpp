@@ -373,7 +373,7 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
 static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
-    const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
+    static const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
     if (env != nullptr) {
         ret = std::min(ret, std::atoi(env));
     }
@@ -1693,9 +1693,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // own epilogue path); gfx1201 (RDNA4) validated 2026-09-06 (see the section comment above).
     // GGML_CUDA_DISABLE_MMQ_ROUTED=1 disables ONLY this compact dispatch (the per-expert J selection
     // in mul_mat_q_switch_J stays; both are part of the same port).
+    static const bool routed_disabled = getenv("GGML_CUDA_DISABLE_MMQ_ROUTED") != nullptr;
     const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && mmq_routed_compact_arch_ok(cc) &&
         !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J) &&
-        getenv("GGML_CUDA_DISABLE_MMQ_ROUTED") == nullptr;
+        !routed_disabled;
     if (use_compact_routed) {
         const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
         ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
@@ -1788,7 +1789,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
             int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
             if constexpr (type == GGML_TYPE_Q6_K) {
-                const char * env = getenv("GGML_Q6_COMPACT_J");
+                static const char * env = getenv("GGML_Q6_COMPACT_J");
                 if (env) {
                     J_rdna3_5 = atoi(env);
                 }
