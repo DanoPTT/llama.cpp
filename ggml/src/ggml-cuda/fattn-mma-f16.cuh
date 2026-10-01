@@ -1030,7 +1030,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
                 // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
                 // instead - not implemented here (RDNA caps route those heads to the tile kernel).
-                if constexpr (!V_is_K_view && !swz_V) {
+                if constexpr (!V_is_K_view && !swz) {
                     if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
                         const int tid = threadIdx.y * warp_size + threadIdx.x;
 #pragma unroll
