@@ -13,6 +13,14 @@
 #include "log.h"
 
 #include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <regex>
+#include <string>
+#include <vector>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -112,7 +120,133 @@ int llama_server(int argc, char ** argv) {
     return llama_server(params, argc, argv);
 }
 
+// DBG67 (bisekcia #67): dump hashov tenzorov prefillu cez cb_eval, zapne LLAMA_DBG67_DUMP=<adresar>.
+// Graf sa splitne len na dumpovanych tenzoroch (l_out-N s viac ako 1 riadkom a result_* za nimi), fuzie vnutri vrstvy ostavaju.
+// LLAMA_DBG67_FILTER = regex mien (default ^(l_out-\d+|result_norm|result_output)$),
+// LLAMA_DBG67_RAW    = regex mien, ktorych surove data sa ulozia do raw-<seq>-<meno>.bin.
+// Vystup: dump.tsv (seq, ub, meno, typ, ne, hash, sum, sumabs, row_off, n_rows) a rows.bin (uint64 hash kazdeho riadku).
+struct dbg67_state {
+    std::regex           filter;
+    std::regex           raw;
+    bool                 has_raw    = false;
+    std::string          dir;
+    FILE *               tsv        = nullptr;
+    FILE *               rows       = nullptr;
+    std::vector<uint8_t> buf;
+    int64_t              seq        = 0;
+    int64_t              ub         = -1;
+    int64_t              row_off    = 0;
+    bool                 in_prefill = false;
+};
+static dbg67_state g_dbg67;
+
+static uint64_t dbg67_hash(const uint8_t * p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    size_t   i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h ^= w;
+        h *= 0x100000001b3ULL;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static bool dbg67_cb_eval(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    auto & s = g_dbg67;
+    if (!std::regex_search(t->name, s.filter)) {
+        return !ask;
+    }
+    const bool is_result = strncmp(t->name, "result_", 7) == 0;
+    const bool want      = is_result ? s.in_prefill : t->ne[1] > 1;
+    if (ask) {
+        return want;
+    }
+    if (!want) {
+        return true;
+    }
+    if (!is_result) {
+        if (strcmp(t->name, "l_out-0") == 0) {
+            s.ub++;
+        }
+        s.in_prefill = true;
+    } else if (strcmp(t->name, "result_output") == 0) {
+        s.in_prefill = false;
+    }
+
+    const size_t n_bytes = ggml_nbytes(t);
+    s.buf.resize(n_bytes);
+    ggml_backend_tensor_get(t, s.buf.data(), 0, n_bytes);
+
+    double sum = 0.0, sumabs = 0.0;
+    if (t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
+        const float * f = (const float *) s.buf.data();
+        for (int64_t i = 0; i < ggml_nelements(t); ++i) {
+            sum    += f[i];
+            sumabs += fabs((double) f[i]);
+        }
+    }
+    int64_t n_rows = 0;
+    if (ggml_is_contiguous(t)) {
+        n_rows = ggml_nrows(t);
+        const size_t rb = ggml_row_size(t->type, t->ne[0]);
+        std::vector<uint64_t> rh(n_rows);
+        for (int64_t r = 0; r < n_rows; ++r) {
+            rh[r] = dbg67_hash(s.buf.data() + r * rb, rb);
+        }
+        fwrite(rh.data(), sizeof(uint64_t), n_rows, s.rows);
+    }
+    fprintf(s.tsv, "%lld\t%lld\t%s\t%s\t%lld\t%lld\t%lld\t%lld\t%016llx\t%.17g\t%.17g\t%lld\t%lld\n", (long long) s.seq,
+            (long long) s.ub, t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+            (long long) t->ne[2], (long long) t->ne[3], (unsigned long long) dbg67_hash(s.buf.data(), n_bytes), sum,
+            sumabs, (long long) s.row_off, (long long) n_rows);
+    s.row_off += n_rows;
+    if (s.has_raw && std::regex_search(t->name, s.raw)) {
+        const std::string fn = s.dir + "/raw-" + std::to_string(s.seq) + "-" + t->name + ".bin";
+        if (FILE * f = fopen(fn.c_str(), "wb")) {
+            fwrite(s.buf.data(), 1, n_bytes, f);
+            fclose(f);
+        }
+    }
+    fflush(s.tsv);
+    fflush(s.rows);
+    s.seq++;
+    return true;
+}
+
+static void dbg67_init(common_params & params) {
+    const char * dir = getenv("LLAMA_DBG67_DUMP");
+    if (dir == nullptr || dir[0] == '\0') {
+        return;
+    }
+    auto & s = g_dbg67;
+    s.dir = dir;
+    const char * flt = getenv("LLAMA_DBG67_FILTER");
+    s.filter = std::regex(flt && flt[0] ? flt : R"(^(l_out-\d+|result_norm|result_output)$)");
+    const char * raw = getenv("LLAMA_DBG67_RAW");
+    if (raw && raw[0]) {
+        s.raw     = std::regex(raw);
+        s.has_raw = true;
+    }
+    s.tsv  = fopen((s.dir + "/dump.tsv").c_str(), "w");
+    s.rows = fopen((s.dir + "/rows.bin").c_str(), "wb");
+    if (!s.tsv || !s.rows) {
+        fprintf(stderr, "DBG67: neda sa otvorit vystup v %s\n", dir);
+        exit(1);
+    }
+    fprintf(s.tsv, "seq\tub\tname\ttype\tne0\tne1\tne2\tne3\thash\tsum\tsumabs\trow_off\tn_rows\n");
+    params.cb_eval           = dbg67_cb_eval;
+    params.cb_eval_user_data = nullptr;
+    fprintf(stderr, "DBG67: dump tenzorov prefillu do %s\n", dir);
+}
+
 int llama_server(common_params & params, int argc, char ** argv) {
+    dbg67_init(params);
     bool is_run_by_cli = (argv == nullptr);
 
     common_models_handler models_handler;
