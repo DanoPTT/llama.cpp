@@ -117,6 +117,23 @@ extern "C" {
         // can be called multiple times for the same tensor: the longest lifetime applies
         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
         void * user_data;
+        // the scheduler will run the graph in sub-graphs split at every eval-callback node, so a
+        // backend optimisation that relies on state living for one whole compute (e.g. eliding a
+        // producer's F32 output and re-reading it from a per-graph cache) must stand down
+        bool has_eval_callback;
+        // the *whole* scheduled graph.  graph_optimize is called per split, but a consumer of a
+        // tensor may live in another split (the per-compute activation cache does not span splits),
+        // so a backend optimisation that elides a producer's output must consult the whole graph to
+        // find every consumer.  NULL means the graph is not split (full_graph == the split graph).
+        const struct ggml_cgraph * full_graph;
+        // Two-pass mode used by the meta (tensor-split) backend.  The meta owns the whole graph, so
+        // the scheduler never calls a child backend's graph_optimize; the meta forwards it twice
+        // instead -- once over the whole graph before allocation (alloc-deps only) and once per
+        // per-device subgraph of simple tensors after allocation (markings only), because the marks
+        // must be keyed by the tensor pointers the child's compute actually sees.  Both default to
+        // false (the single-backend scheduler runs the complete pass in one call).
+        bool marks_only;
+        bool allocs_only;
     };
 
     struct ggml_backend_i {
@@ -152,8 +169,83 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
+        // (optional) op-offload H2D staging (issue #50 WIP): overlap a whole-tensor host->device
+        // weight upload with the previous split's compute.  `stage_buffer` returns a device buffer of
+        // at least `size` bytes for ring `slot` (NULL on allocation failure); `stage_upload` issues the
+        // host->device copy into `dst` on the backend's auxiliary copy stream and records `ev` there;
+        // `stage_wait` makes that copy stream wait for `ev` (recorded on the main stream); `stage_d2d`
+        // copies the staged bytes to their destination on the main stream.  A backend that does not
+        // implement these leaves all four NULL and the scheduler keeps the in-order copy path.
+        void * (*stage_buffer)(ggml_backend_t backend, int slot, size_t size);
+        void   (*stage_upload)(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
+        // (optional) like `stage_upload`, but for a split upload whose device slice is strided in the
+        // source weight: the device owns `n_copies` blocks of `width` bytes, `stride_src` apart, starting
+        // `offset` bytes into the contiguous host source `src`.  The implementation assembles the compacted
+        // slice into ring `slot` (a host gather for a small `n_copies`, else a whole-range H2D plus a device
+        // 2-D compaction) and records `ev` on the copy stream.  Returns false if it cannot stage.
+        bool   (*stage_gather)(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev);
+        void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
+        void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+        // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
+        // scheduler uses it to pick the staging gate (a narrow link needs a wider batch).
+        float  (*stage_h2d_gbps)(ggml_backend_t backend);
+
+        // (optional) op-offload H2D staging owned by the split's backend.  The four hooks above
+        // assume one destination and a device event on the split backend's device; under `-sm tensor`
+        // neither exists -- one logical upload is spliced across N devices, and the split's consumers
+        // read per-device "simple" tensors rather than the split tensor's `data`, so a redirect of
+        // that pointer can never reach the op.  Such a backend stages the input itself instead: it is
+        // called with the source `input` (a host weight) and the split input `input_cpy`, lands each
+        // device's chunk in that device's own ring, and returns true; the scheduler then skips its own
+        // copy path for this input.  Only consulted when the staging gate is open (the backend must
+        // implement `stage_h2d_gbps` so the gate is calibrated, and must advertise this hook so the
+        // scheduler does not report staging as unsupported).
+        bool   (*stage_input)(ggml_backend_t backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy);
+
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) MoE expert cache (wip/moe-expert-cache): called by the scheduler when a
+        // host-resident `MUL_MAT_ID` weight is about to be uploaded, with the *host master*
+        // (`weight`), the scheduler's redirected device tensor the op will read (`weight_cpy`),
+        // and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).  This is the
+        // only place both the master and the routing are available: the op-offload redirect makes
+        // the op's `src0->data` point at `weight_cpy`.  Lets the backend drive its residency
+        // policy, fill its own compact slots from the true master, and stage the slot-remapped
+        // ids.  Returns true when it took the input over, in which case the scheduler skips its
+        // own expert copy and the op reads the compact arena (via `moe_cache_get_table`).  A
+        // backend that does not implement it leaves it NULL and the scheduler is unchanged.
+        //
+        // `slice_off`/`split_axis` describe the device's slice of the host master under `-sm tensor`
+        // (wip/moe-expert-cache Phase 3): `split_axis` is the axis the master is split on (0/1, or -1
+        // for an unsplit whole-expert table) and `slice_off` is the byte offset of this device's slice
+        // inside one host expert blob.  When the split backend is the Meta backend it does not
+        // implement the policy itself; it computes these per device from the meta split state and
+        // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
+        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis);
+
+        // wip/moe-expert-cache (session 7) identity/device-remap fast path.  Return true iff this expert
+        // input is cache-managed and the consumer can read the arena WITHOUT the host routing: an
+        // identity table (slot == expert, raw ids) or a device-remap table (a device slot map + a small
+        // remap kernel).  The scheduler calls this BEFORE the ids readback; a true lets it skip the
+        // readback, the full device synchronize it forces, the used-expert pruning and the copy.
+        // `need_promote` is set for a device-remap table, whose routing must be recorded for the deferred
+        // promotion pass.  The Meta backend forwards to each simple backend and returns true only if
+        // every device took over.
+        bool (*moe_cache_take_over)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, bool * need_promote);
+
+        // wip/moe-expert-cache: deferred promotion for a device-remap table - run the LFRU admission +
+        // fills for the used experts (`ids`, a contiguous host `n_used x n_tok` int32 copy) and refresh
+        // the device slot map.  Called by the scheduler once per token, after the graph.
+        bool (*moe_cache_promote)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1);
+
+        // wip/moe-expert-cache (B2): device-side host-weight expert gather for an offloaded `MUL_MAT_ID`
+        // prefill.  Copy only the routed experts from the host master (`weight`) into the device tensor
+        // the op reads (`weight_cpy`), reading the routing (`ids`, device, strided) on the device.  Lets
+        // the scheduler skip the per-op ids readback + full device synchronize it forces.  `slice_off`/
+        // `split_axis` are the per-device slice geometry (0/-1 for an unsplit table).  The Meta backend
+        // forwards to each simple backend and returns true only if every device took it.
+        bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
     };
 
     struct ggml_backend {
