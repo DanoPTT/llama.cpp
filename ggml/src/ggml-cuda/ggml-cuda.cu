@@ -38,6 +38,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmb.cuh"
 #include "ggml-cuda/moe-expert-cache.h"
+#include "ggml-cuda/cpy-batch.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -4736,6 +4737,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // batched copy (GGML_CUDA_FUSE_CPY_BATCH=0: off): consecutive same-layout f32 copies as one launch
+    if (node->op == GGML_OP_CPY && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int taken = ggml_cuda_cpy_batch(*cuda_ctx, cgraph, i);
+        if (taken >= 2) {
+            return taken - 1;
+        }
+    }
+
+    // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0: off): an F32 GLU whose next node (or the one after a reshape) is a verify-band
+    // mmvq matmul over it is marked here (RDNA4 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
+    // GLU launcher then also writes the matmul's Q8_1 blocks into the quantize cache, which the matmul finds.
+    static const bool fuse_glu_q8_1 = getenv("GGML_CUDA_FUSE_GLU_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GLU_Q8_1")) != 0;
+    cuda_ctx->glu_q8_1_node = nullptr;
+    cuda_ctx->glu_q8_1_mm   = nullptr;
+    if (node->op == GGML_OP_GLU && fuse_glu_q8_1 && node->type == GGML_TYPE_F32 &&
+            node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % QK8_1 == 0) {
+        const ggml_tensor * mm = nullptr;
+        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
+            mm = cgraph->nodes[i + 1];
+        } else if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+                   cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT) {
+            mm = cgraph->nodes[i + 2];
+        }
+        if (mm != nullptr) {
+            const ggml_tensor * a = mm->src[1];
+            const ggml_tensor * a_root = a;
+            while (a_root->view_src != nullptr) {
+                a_root = a_root->view_src;
+            }
+            if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&
+                    a->ne[1] >= 2 && ggml_is_quantized(mm->src[0]->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+                cuda_ctx->glu_q8_1_node = node;
+                cuda_ctx->glu_q8_1_mm   = mm;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {

@@ -1641,6 +1641,12 @@ struct ggml_backend_cuda_context {
     };
     char * q8_1_arena = nullptr;
     size_t q8_1_arena_size = 0;
+
+    // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
+    // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+    // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
+    const ggml_tensor * glu_q8_1_node = nullptr;
+    const ggml_tensor * glu_q8_1_mm   = nullptr;
     std::vector<q8_1_cache_entry> q8_1_cache;
     size_t q8_1_arena_pos = 0;
 
