@@ -1117,6 +1117,8 @@ void ggml_cuda_graph_mem_freed(int device) {
     g_cuda_graph_mem_gen[device]++;
 }
 
+static bool ggml_cuda_graph_capture_active();
+
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
@@ -1128,9 +1130,17 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    // GGML_CUDA_POOL_CACHE_MB: cap on the bytes of FREED buffers the pool keeps cached (unset/0 = unlimited).
+    // Temporaries that grow with the KV length (long prefills) otherwise leave every smaller predecessor cached,
+    // and that idle VRAM starves allocations made outside the pool (graph/compute buffers, FA staging).
+    size_t cached_size = 0;
+    size_t cache_cap   = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
+        const char * cap = getenv("GGML_CUDA_POOL_CACHE_MB");
+        const long long mb = cap ? atoll(cap) : 0;
+        cache_cap = mb > 0 ? (size_t) mb << 20 : 0;
     }
 
     ~ggml_cuda_pool_leg() {
@@ -1150,6 +1160,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 b.size = 0;
             }
         }
+        cached_size = 0;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -1174,6 +1185,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                         if (!best_diff) {
                             void * ptr = b.ptr;
                             *actual_size = b.size;
+                            cached_size -= b.size;
                             b.ptr = nullptr;
                             b.size = 0;
                             return ptr;
@@ -1186,6 +1198,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             ggml_cuda_buffer& b = buffer_pool[ibest];
             void * ptr = b.ptr;
             *actual_size = b.size;
+            cached_size -= b.size;
             b.ptr = nullptr;
             b.size = 0;
             return ptr;
@@ -1194,6 +1207,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        // never flush while a CUDA graph is being captured: the sync is illegal and the capture may reference the
+        // cached buffers; the next allocation outside capture flushes instead
+        if (cache_cap && cached_size > cache_cap && !ggml_cuda_graph_capture_active()) {
+            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: %.2f MiB cached exceeds GGML_CUDA_POOL_CACHE_MB, flushing\n",
+                           device, cached_size/1024.0/1024.0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            clear_pool();
+        }
         static const bool gc_dbg = getenv("GGML_CUDA_GCDBG") != nullptr;
         const int64_t t_pl = gc_dbg ? ggml_time_us() : 0;
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
@@ -1228,6 +1249,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                cached_size += size;
                 return;
             }
         }
@@ -1409,6 +1431,10 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
+
+static bool ggml_cuda_graph_capture_active() {
+    return ggml_cuda_lock_counter.load(std::memory_order_relaxed) > 0;
+}
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_mmb_release_all();
