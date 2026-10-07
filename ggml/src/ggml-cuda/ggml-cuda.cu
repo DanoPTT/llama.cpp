@@ -4832,6 +4832,71 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// GET_ROWS that gathers a GATED_DELTA_NET input state from the recurrent cache (build_rs): the GDN can read the cache
+// rows itself (row ids = the gather's src[1]), so the gather is skipped (GGML_CUDA_FUSE_GDN_STATE_GATHER=0: off).
+// Only when the row ids are a graph output (the allocator never reuses them; llama flags rs_s_copy so), the GDN is
+// in this graph, in the decode/verify band (single sequence, <= 16 tokens: the sequential kernel), every other reader
+// of the gathered rows is empty (the zero-row extra-states copy of a single sequence), and no node in between writes
+// the cache tensor.
+static bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gr->src[0]->type != GGML_TYPE_F32 || gr->src[0]->nb[0] != sizeof(float) || gr->src[0]->ne[0] != gr->ne[0] ||
+        gr->src[1]->type != GGML_TYPE_I32 || gr->src[1]->nb[0] != sizeof(int32_t) || !ggml_is_contiguous(gr)) {
+        return false;
+    }
+
+    auto root_of = [](const ggml_tensor * t) {
+        while (t != nullptr && t->view_src != nullptr) {
+            t = t->view_src;
+        }
+        return t;
+    };
+    const ggml_tensor * cache_root = root_of(gr->src[0]);
+
+    // the row ids are read when the GDN runs, so they must outlive the gather: graph outputs are never reused
+    if (!(root_of(gr->src[1])->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * gdn = nullptr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n)) {
+            continue;
+        }
+        bool reads_gr = n->view_src != nullptr && root_of(n) == gr;
+        for (int s = 0; s < GGML_MAX_SRC && !reads_gr; ++s) {
+            reads_gr = n->src[s] != nullptr && root_of(n->src[s]) == gr;
+        }
+        if (n->op == GGML_OP_GATED_DELTA_NET && root_of(n->src[5]) == gr) {
+            if (gdn != nullptr) {
+                return false;
+            }
+            gdn = n;
+            continue;
+        }
+        if (reads_gr) {
+            if (ggml_cuda_is_view_or_noop(n)) {
+                continue; // the reshape/view chain into the GDN (a view reads nothing)
+            }
+            return false;
+        }
+        // nothing may write the cache before the GDN reads it
+        if (gdn == nullptr && !ggml_cuda_is_view_or_noop(n) && root_of(n) == cache_root) {
+            return false;
+        }
+    }
+    if (gdn == nullptr || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const ggml_tensor * src_v = gdn->src[2];
+    const ggml_tensor * state = gdn->src[5];
+    return src_v->ne[2] <= 16 && src_v->ne[3] == 1 && state->data == gr->data &&
+           ggml_nelements(state) == gr->ne[0] && gr->ne[0] == src_v->ne[0] * src_v->ne[0] * src_v->ne[1];
+}
+
 static bool ggml_cuda_topk_moe_fusion_disabled() {
     // A/B kill-switch for the fused MoE router.  The fused kernel is bit-identical to the generic
     // softmax -> argsort -> get_rows -> norm chain (both the softmax reduction/normalization and
@@ -8055,6 +8120,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
+            static const bool fuse_gdn_state_gather =
+                (getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER")) != 0) &&
+                (getenv("GGML_CUDA_DISABLE_FUSION") == nullptr || atoi(getenv("GGML_CUDA_DISABLE_FUSION")) == 0);
+            cuda_ctx->gdn_deferred_gathers.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -8094,6 +8163,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (fuse_gdn_state_gather && node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_deferrable(cgraph, i)) {
+                    cuda_ctx->gdn_deferred_gathers.push_back(node);
                     continue;
                 }
 

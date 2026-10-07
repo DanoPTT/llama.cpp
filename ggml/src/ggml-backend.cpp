@@ -1823,6 +1823,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                            } else if (src->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                                ggml_set_output(tensor_copy); // the source must stay alive for the whole graph: so must its copy
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
