@@ -70,6 +70,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_SKIP_MANAGED    = 1 << 6; // like TENSOR_SKIP, but for a tensor whose data is read on demand elsewhere (managed lazy reader); no "unused tensor" warning
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -80,6 +81,9 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    // true: host-resident expert weights (`-ncmoe`/`-cmoe`) stay in the pageable model mmap
+    // false (default): keep them in the device's pinned host buffer (ROCm_Host)
+    bool mmap_host_experts = false;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -90,9 +94,21 @@ struct llama_model_loader {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
+        // managed buffer size in bytes for the managed LAZY_MODE_AUTO PLE reader
+        // (qwen4exp per_layer_token_embd); 0 = no managed reader (fall back to the mmap
+        // lazy path / full load).  Set by the caller before the create_tensor() calls.
+        size_t managed_budget = 0;
+
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+
+        // record the on-disk range of a tensor whose data is loaded on demand by
+        // other means (the managed lazy reader). Unlike add(), this does not
+        // consult the lazy mode or the tensor size: the range must be excluded
+        // from the load-time WILLNEED prefetch either way, or the kernel would
+        // fault the whole table in
+        void add_range(const std::string & name, const llama_tensor_weight & w);
 
         bool any() const {
             return !ranges.empty();
@@ -140,6 +156,10 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // wip/moe-cache-autosize: bytes of host-resident MoE expert weights per device, accumulated by
+    // `create_tensor` (works under `no_alloc`, unlike a scan of the allocated tensors).
+    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -158,7 +178,18 @@ struct llama_model_loader {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
-            return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+            const int c = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (c != 0) {
+                return c < 0;
+            }
+            // Distinct buffer types can share a name (e.g. the per-device pinned host buffers: one
+            // name, a per-device `device`).  They must not share a context, or every device's host
+            // tensors land in the first device's buffer (and so in its ops' device).
+            ggml_backend_dev_t lhs_dev = ggml_backend_buft_get_device(lhs.buft);
+            ggml_backend_dev_t rhs_dev = ggml_backend_buft_get_device(rhs.buft);
+            const char * lhs_name = lhs_dev ? ggml_backend_dev_name(lhs_dev) : "";
+            const char * rhs_name = rhs_dev ? ggml_backend_dev_name(rhs_dev) : "";
+            return strcmp(lhs_name, rhs_name) < 0;
         }
     };
 
@@ -179,6 +210,7 @@ struct llama_model_loader {
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
         llama_load_mode load_mode,
+        llama_host_experts_mode host_experts_mode,
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,

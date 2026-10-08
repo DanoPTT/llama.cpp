@@ -537,6 +537,7 @@ llama_model_loader::llama_model_loader(
         std::vector<std::string> & splits,
         FILE * file,
         llama_load_mode load_mode,
+        llama_host_experts_mode host_experts_mode,
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
@@ -558,6 +559,18 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+
+    // Host-resident expert weights: pinned by default (fast H2D uploads / device-readable host master).
+    // AUTO keeps the legacy env knob (LLAMA_MMAP_HOST_EXPERTS=0 selects the pageable mmap); the explicit
+    // modes ignore it.  See llama_host_experts_mode.
+    {
+        bool mmap = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP;
+        if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_AUTO) {
+            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
+            mmap = e != nullptr && atoi(e) == 0;
+        }
+        this->mmap_host_experts = mmap;
+    }
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1113,6 +1126,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+void llama_model_loader::lazy_read::add_range(const std::string & name, const llama_tensor_weight & w) {
+    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+    tensors.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) excluded from the load-time prefetch\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1175,9 +1196,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP) || (flags & TENSOR_SKIP_MANAGED)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_MANAGED)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1216,7 +1239,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list;
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
-                buft_list = buft_list_input;
+                // the per-layer token embedding is a huge table that the model gathers on the host
+                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
+                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
+                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
                 break;
             case LLM_TENSOR_LAYER_OUTPUT:
                 buft_list = buft_list_output;
@@ -1238,8 +1264,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
-                        // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // Host-resident MoE experts: a device's host buffer type carries that device, and
+                        // the scheduler places the consumers of its tensors there.  Picking the device-0
+                        // host buffer for every layer would route every expert op to device 0 under
+                        // `-sm layer` (the other GPUs idle on the expert half).  Prefer the host buffer of
+                        // the device this layer is assigned to.
+                        if (op == GGML_OP_MUL_MAT_ID && buft_list_layer != nullptr && !buft_list_layer->empty()) {
+                            ggml_backend_dev_t layer_dev = buft_list_layer->front().first;
+                            ggml_backend_buffer_type_t layer_host_buft =
+                                layer_dev != nullptr ? ggml_backend_dev_host_buffer_type(layer_dev) : nullptr;
+                            if (layer_host_buft != nullptr &&
+                                    weight_buft_supported(hparams, t_meta, op, layer_host_buft, layer_dev)) {
+                                buft = layer_host_buft;
+                            }
+                        }
+                        // Under `-sm tensor` the layer's device is the Meta device.  Its host buffer type
+                        // is null when its simple devices have distinct per-device host buffer types
+                        // (our per-device ROCm_Host), so the fallback below would put the host expert
+                        // master in the pageable CPU_REPACK buffer.  A device reads that master directly
+                        // (the split upload / UVA), and it must also be recognised as host memory for the
+                        // loader's byte accounting and the MoE expert cache -- so prefer a real device's
+                        // pinned host buffer type.  LLAMA_TENSOR_HOST_BUFT=0 restores the CPU_REPACK path.
+                        static const bool tensor_host_buft = [] {
+                            const char * e = getenv("LLAMA_TENSOR_HOST_BUFT");
+                            return e == nullptr || atoi(e) != 0;
+                        }();
+                        if (buft == nullptr && tensor_host_buft && op == GGML_OP_MUL_MAT_ID) {
+                            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                                ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                                if (hb == nullptr || hb == ggml_backend_cpu_buffer_type()) {
+                                    continue;
+                                }
+                                if (weight_buft_supported(hparams, t_meta, op, hb, dev)) {
+                                    buft = hb;
+                                    break;
+                                }
+                            }
+                        }
+                        if (buft == nullptr) {
+                            // when overriding to a CPU buffer, consider the extra buffer types
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1267,8 +1333,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // avoid using a host buffer when using mmap
+        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
+        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
+        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
+        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
+        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
+        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
+        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  `--host-experts mmap` (or the legacy
+        // `LLAMA_MMAP_HOST_EXPERTS=0`) restores the mmap downgrade.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+                !(!mmap_host_experts && op == GGML_OP_MUL_MAT_ID)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1326,7 +1401,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) { // e.g. TENSOR_SKIP
+            return nullptr;
+        }
+        if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+            moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
@@ -1339,8 +1419,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (flags & TENSOR_READ_LAZY && !files.empty()) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+        // note: the user path (llama_model_init_from_user) has no files to lazy-read from, so the
+        //   tensor is created normally there and filled via set_tensor_data
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
@@ -1363,6 +1445,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+    if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+        moe_host_expert_bytes[ggml_backend_buft_get_device(buft)] += ggml_nbytes(&t_meta);
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
