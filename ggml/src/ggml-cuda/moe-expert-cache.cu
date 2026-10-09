@@ -18,6 +18,33 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+// Positional GGUF reads for the host-expert pool.  POSIX only: pread/O_DIRECT/posix_memalign/st_blksize do not
+// exist on Windows, so there the open fails and the pool marks itself failed (fail-soft, a miss is then served
+// from the pinned master as without the pool).  Dense models never create the pool.
+#include <string>
+typedef long long pool_ssize_t;
+#if !defined(_WIN32)
+static int pool_open_file(const std::string & path, bool dio) {
+    return open(path.c_str(), O_RDONLY | (dio ? O_DIRECT : 0));
+}
+static size_t pool_fd_align(int fd) {
+    struct stat st;
+    return fstat(fd, &st) == 0 && st.st_blksize > 0 ? (size_t) st.st_blksize : 0;
+}
+static pool_ssize_t pool_pread(int fd, void * dst, size_t len, size_t off) {
+    return (pool_ssize_t) pread(fd, dst, len, (off_t) off);
+}
+static void * pool_aligned_alloc(size_t align, size_t len) {
+    void * p = nullptr;
+    return posix_memalign(&p, align, len) == 0 ? p : nullptr;
+}
+#else
+static int          pool_open_file(const std::string &, bool) { return -1; }
+static size_t       pool_fd_align(int) { return 0; }
+static pool_ssize_t pool_pread(int, void *, size_t, size_t) { return -1; }
+static void *       pool_aligned_alloc(size_t, size_t) { return nullptr; }
+#endif
 #include <condition_variable>
 #include <deque>
 #include <set>
@@ -611,8 +638,8 @@ static bool pool_dio_read(int fd, void * dst, size_t len, size_t off, size_t ali
         align = 4096;
     }
     if (off % align == 0 && len % align == 0 && ((uintptr_t) dst % align) == 0) {
-        const ssize_t n = pread(fd, dst, len, (off_t) off);
-        return n == (ssize_t) len;
+        const pool_ssize_t n = pool_pread(fd, dst, len, off);
+        return n == (pool_ssize_t) len;
     }
     const size_t aoff = off & ~(align - 1);
     const size_t skip = off - aoff;
@@ -623,14 +650,14 @@ static bool pool_dio_read(int fd, void * dst, size_t len, size_t off, size_t ali
         free(bounce);
         bounce = nullptr;
         bounce_size = 0;
-        void * p = nullptr;
-        if (posix_memalign(&p, align, blen) != 0) {
+        void * p = pool_aligned_alloc(align, blen);
+        if (p == nullptr) {
             return false;
         }
         bounce = p;
         bounce_size = blen;
     }
-    const ssize_t n = pread(fd, bounce, blen, (off_t) aoff);
+    const pool_ssize_t n = pool_pread(fd, bounce, blen, aoff);
     if (n < 0 || (size_t) n < skip + len) {
         return false;
     }
@@ -861,20 +888,19 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
         return nullptr;
     }
     if (p.fd < 0) {
-        p.fd = open(p.path.c_str(), O_RDONLY | (g_pool_dio ? O_DIRECT : 0));
+        p.fd = pool_open_file(p.path, g_pool_dio);
         if (p.fd < 0) {
             p.failed = true;
             return nullptr;
         }
-        struct stat st;
-        if (fstat(p.fd, &st) == 0 && st.st_blksize > 0) {
-            p.align = (size_t) st.st_blksize;
+        if (const size_t a = pool_fd_align(p.fd)) {
+            p.align = a;
         }
     }
     const size_t off = p.file_offs + (size_t) expert * p.host_bytes;
     char *       dst = p.base + (size_t) slot * p.host_bytes;
     const bool ok = g_pool_dio ? pool_dio_read(p.fd, dst, p.host_bytes, off, p.align)
-                               : (pread(p.fd, dst, p.host_bytes, (off_t) off) == (ssize_t) p.host_bytes);
+                               : (pool_pread(p.fd, dst, p.host_bytes, off) == (pool_ssize_t) p.host_bytes);
     if (!ok) {
         p.failed = true;
         return nullptr;
@@ -987,14 +1013,13 @@ static void pool_bg_worker() {
                 continue;   // every slot is reserved or retiring: drop the prefetch
             }
             if (p->fd < 0) {
-                p->fd = open(p->path.c_str(), O_RDONLY | (g_pool_dio ? O_DIRECT : 0));
+                p->fd = pool_open_file(p->path, g_pool_dio);
                 if (p->fd < 0) {
                     p->failed = true;
                     continue;
                 }
-                struct stat st;
-                if (fstat(p->fd, &st) == 0 && st.st_blksize > 0) {
-                    p->align = (size_t) st.st_blksize;
+                if (const size_t a = pool_fd_align(p->fd)) {
+                    p->align = a;
                 }
             }
             p->slot_expert[(size_t) slot] = ex;
@@ -1008,7 +1033,7 @@ static void pool_bg_worker() {
             dst   = p->base + (size_t) slot * p->host_bytes;
         }
         const bool ok = g_pool_dio ? pool_dio_read(fd, dst, hb, off, align)
-                                   : (pread(fd, dst, hb, (off_t) off) == (ssize_t) hb);
+                                   : (pool_pread(fd, dst, hb, off) == (pool_ssize_t) hb);
         {
             std::lock_guard<std::mutex> lk(g_mutex);
             if (p->slot_state[(size_t) slot] == 3) {
