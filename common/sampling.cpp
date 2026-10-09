@@ -109,6 +109,39 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// S2 block prefilter, 64 logits: the block max (only a filter: any logit above the threshold makes it exceed the
+// threshold too) and whether the block holds a NaN (the caller then takes the full path).  The scalar loop is not
+// vectorized by the compiler (a float max reduction without fast-math), and it runs over the whole vocabulary for
+// every sampled position.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+__attribute__((target("avx2")))
+static void topk_block_scan_avx2(const float * p, float & bm, bool & bn) {
+    __m256 m   = _mm256_set1_ps(-INFINITY);
+    __m256 nan = _mm256_setzero_ps();
+    for (int j = 0; j < 64; j += 8) {
+        const __m256 x = _mm256_loadu_ps(p + j);
+        m   = _mm256_max_ps(m, x);
+        nan = _mm256_or_ps(nan, _mm256_cmp_ps(x, x, _CMP_UNORD_Q));
+    }
+    alignas(32) float v[8];
+    _mm256_store_ps(v, m);
+    float r = v[0];
+    for (int j = 1; j < 8; ++j) {
+        r = v[j] > r ? v[j] : r;
+    }
+    bm = r;
+    bn = _mm256_movemask_ps(nan) != 0;
+}
+static bool topk_block_scan_avx2_ok() {
+    static const bool ok = __builtin_cpu_supports("avx2");
+    return ok;
+}
+#else
+static void topk_block_scan_avx2(const float *, float &, bool &) {}
+static bool topk_block_scan_avx2_ok() { return false; }
+#endif
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -152,10 +185,14 @@ struct common_sampler {
             const int i1 = std::min(i0 + B, n_vocab);
             float bm = -INFINITY;
             bool  bn = false;
-            for (int i = i0; i < i1; ++i) {
-                const float x = logits[i];
-                bm = x > bm ? x : bm;
-                bn |= x != x;
+            if (i1 - i0 == B && topk_block_scan_avx2_ok()) {
+                topk_block_scan_avx2(logits + i0, bm, bn);
+            } else {
+                for (int i = i0; i < i1; ++i) {
+                    const float x = logits[i];
+                    bm = x > bm ? x : bm;
+                    bn |= x != x;
+                }
             }
             bad |= bn;
             if (!(bm > thr)) {
