@@ -17,9 +17,16 @@
 // wip/host-expert-dio-cache Phase 1 (plumbing, inert): the host-expert on-disk source registry lives in
 // ggml-cuda.  libllama already links libggml-hip, so declaring it here avoids a layering include.  The
 // call is a no-op unless MOE_HOST_POOL_MIB > 0, so with the env unset/0 nothing is created.
+#ifdef _WIN32
+// ggml-hip.dll does not export these (no GGML_API), so libllama cannot link them on Windows.  The host
+// pool is fail-soft there anyway (no POSIX direct I/O), so the hooks are no-ops.
+static void moe_cache_set_host_source(const void *, const char *, size_t, int, size_t, size_t) {}
+static void moe_cache_set_host_pool(bool) {}
+#else
 void moe_cache_set_host_source(const void * tensor_data, const char * path, size_t offs,
                                int n_experts, size_t host_bytes, size_t total_bytes);
 void moe_cache_set_host_pool(bool on);
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -578,8 +585,12 @@ llama_model_loader::llama_model_loader(
     }
     if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
         moe_cache_set_host_pool(true);
+#ifdef _WIN32
+        LLAMA_LOG_WARN("%s: host_experts_mode=POOL is not supported on Windows; ignored\n", __func__);
+#else
         LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
                        "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", __func__);
+#endif
     }
 
     if (!fname.empty()) {
