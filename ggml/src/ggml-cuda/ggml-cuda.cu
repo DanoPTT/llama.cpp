@@ -171,8 +171,7 @@ static void ggml_cuda_alloc_trace(const char * what, int device, size_t size, co
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         (void) cudaGetLastError();
     }
-    GGML_LOG_WARN("ALLOC_TRACE %s dev %d size %.2f MiB | vram free %.0f / %.0f MiB %s
-",
+    GGML_LOG_WARN("ALLOC_TRACE %s dev %d size %.2f MiB | vram free %.0f / %.0f MiB %s\n",
                   what, device, size / 1048576.0, free_b / 1048576.0, total_b / 1048576.0, extra);
 }
 
