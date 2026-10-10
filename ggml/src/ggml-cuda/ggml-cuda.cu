@@ -160,6 +160,22 @@ bool ggml_cuda_slab_active(int device);
 
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 
+// f711 spill hunt (10.10.2026): GGML_CUDA_ALLOC_TRACE=1 logs every device allocation/free with the free VRAM the
+// driver reports, so a long-prefill spill on Windows/WDDM can be attributed to the allocation that caused it.
+static bool ggml_cuda_alloc_trace_on() {
+    static const bool on = getenv("GGML_CUDA_ALLOC_TRACE") != nullptr;
+    return on;
+}
+static void ggml_cuda_alloc_trace(const char * what, int device, size_t size, const char * extra = "") {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+    GGML_LOG_WARN("ALLOC_TRACE %s dev %d size %.2f MiB | vram free %.0f / %.0f MiB %s
+",
+                  what, device, size / 1048576.0, free_b / 1048576.0, total_b / 1048576.0, extra);
+}
+
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -232,6 +248,9 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
         // OPEN 2 debug validator (no-op unless MOE_EXPERT_CACHE_VALIDATE is set): catch a cache the
         // stand-down left inconsistent before the next graph reads it.
         moe_cache_validate("device-malloc-yield");
+    }
+    if (ggml_cuda_alloc_trace_on()) {
+        ggml_cuda_alloc_trace(err == cudaSuccess ? "malloc" : "malloc-FAILED", device, size);
     }
     return err;
 }
@@ -1150,6 +1169,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     void clear_pool() {
         ggml_cuda_set_device(device);
+        if (ggml_cuda_alloc_trace_on()) {
+            ggml_cuda_alloc_trace("pool-clear", device, pool_size);
+        }
         ggml_cuda_graph_mem_freed(device);
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
@@ -1236,6 +1258,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        if (ggml_cuda_alloc_trace_on()) {
+            int nbuf = 0; size_t max_cached = 0;
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                if (buffer_pool[i].ptr != nullptr) { ++nbuf; max_cached = std::max(max_cached, buffer_pool[i].size); }
+            }
+            char extra[192];
+            snprintf(extra, sizeof(extra), "| pool[%d] new: requested %.2f MiB, pool_size %.2f MiB, cached %.2f MiB in %d bufs (largest %.2f MiB)",
+                     device, size / 1048576.0, pool_size / 1048576.0, cached_size / 1048576.0, nbuf, max_cached / 1048576.0);
+            ggml_cuda_alloc_trace("pool-new", device, look_ahead_size, extra);
+        }
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -1261,6 +1293,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(cudaFree(ptr));
         if (t_pf) { g_pool_free_us += ggml_time_us() - t_pf; g_pool_free_n++; }
         pool_size -= size;
+        if (ggml_cuda_alloc_trace_on()) {
+            ggml_cuda_alloc_trace("pool-free-full", device, size);
+        }
     }
 };
 
@@ -1505,7 +1540,13 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    const bool trace = ggml_cuda_alloc_trace_on();
+    const bool view  = ctx->slab_view;
+    const int  dev   = ctx->device;
     delete ctx;
+    if (trace) {
+        ggml_cuda_alloc_trace(view ? "buffer-free-slabview" : "buffer-free", dev, ggml_backend_buffer_get_size(buffer));
+    }
 }
 
 static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
@@ -1724,6 +1765,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
                 ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
                 ctx->slab_view     = true;
                 ctx->slab_need     = size;
+                if (ggml_cuda_alloc_trace_on()) {
+                    ggml_cuda_alloc_trace("slab-view", buft_ctx->device, size);
+                }
                 return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
             }
             GGML_LOG_WARN("%s: slab work region has no room for %.2f MiB on device %d; falling back\n",
@@ -8153,6 +8197,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ggml_cuda_alloc_trace_on()) {
+        static size_t last_free[GGML_CUDA_MAX_DEVICES] = {};
+        static int64_t n_compute = 0;
+        n_compute++;
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            const size_t d = free_b > last_free[cuda_ctx->device] ? free_b - last_free[cuda_ctx->device] : last_free[cuda_ctx->device] - free_b;
+            if (d >= (64u << 20)) {
+                char extra[96];
+                snprintf(extra, sizeof(extra), "| compute #%lld nodes %d", (long long) n_compute, cgraph->n_nodes);
+                ggml_cuda_alloc_trace("compute-sample", cuda_ctx->device, 0, extra);
+                last_free[cuda_ctx->device] = free_b;
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
 
     if (g_stream_dbg_on) {
         static int n = 0;
