@@ -133,10 +133,25 @@ static void topk_block_scan_avx2(const float * p, float & bm, bool & bn) {
     bm = r;
     bn = _mm256_movemask_ps(nan) != 0;
 }
+#ifdef _WIN32
+// clang with the MSVC ABI does not link compiler-rt, so __builtin_cpu_supports leaves __cpu_model undefined.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+static bool topk_block_scan_avx2_ok() {
+    static const bool ok = IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != 0;
+    return ok;
+}
+#else
 static bool topk_block_scan_avx2_ok() {
     static const bool ok = __builtin_cpu_supports("avx2");
     return ok;
 }
+#endif
 #else
 static void topk_block_scan_avx2(const float *, float &, bool &) {}
 static bool topk_block_scan_avx2_ok() { return false; }
