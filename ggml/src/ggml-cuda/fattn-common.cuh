@@ -1964,7 +1964,21 @@ void launch_fattn(
     const bool stage_wants_K = !native_width && stage_cap_K && kv_native_K != FATTN_KV_NATIVE_NONE;
     const bool stage_wants_V = !native_width && stage_cap_V && kv_native_V != FATTN_KV_NATIVE_NONE && !V_is_K_view;
     const size_t stage_req = (stage_wants_K ? stage_bytes_K : 0) + (stage_wants_V ? stage_bytes_V : 0);
-    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req) : nullptr;
+    // f711 (11.10.2026): the largest request this operand pair can ever make is the F16 size of the
+    // whole cache tensor the K/V views point into (view_src is always the root tensor), capped per
+    // operand like the request itself.  Passed as a hint so the arena is allocated once at that size
+    // instead of growing 1.25x per step: on Windows/HIP every freed step stays committed under WDDM,
+    // so a 119k q8_0 prefill left +2.65 GiB of dead arenas (raw-logs/vram-krok2-2026-10-11).
+    size_t stage_hint = 0;
+    if (stage_req != 0) {
+        auto full_bytes = [stage_max_bytes](const ggml_tensor * t) {
+            const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
+            const size_t b = (size_t) ggml_nelements(root)*sizeof(half);
+            return stage_max_bytes != 0 ? std::min(b, stage_max_bytes) : b;
+        };
+        stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+    }
+    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
     const bool stage_ok = stage_buf != nullptr;
 
     const bool use_native_K = (native_width || !stage_ok || !stage_cap_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
