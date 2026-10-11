@@ -1807,12 +1807,32 @@ struct ggml_backend_cuda_context {
     // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
     // less free memory at the first deep prefill than the fit projected; failing here must degrade
     // to the native read, not kill the run.
-    void * fattn_stage_try_get(int stream_no, size_t size) {
+    //
+    // f711 (11.10.2026): `size_hint` is the largest request the caller can ever make (whole-cache
+    // depth).  When it is set, the arena is allocated at that size right away, so a deep prefill does
+    // not walk the 1.25x growth ladder: under WDDM a cudaFree'd arena stays committed, and the ladder
+    // left ~5x the final arena (2.65 GiB at a 119k q8_0 prefill) as dead VRAM until the next spill.
+    // If the hint does not fit, the 1.25x growth below is tried as before.
+    // GGML_CUDA_FA_STAGE_PREALLOC=0 disables the hint (A/B in one binary).
+    void * fattn_stage_try_get(int stream_no, size_t size, size_t size_hint = 0) {
         GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
         if (size > fattn_stage_size[stream_no]) {
-            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
+            static const bool prealloc = []() {
+                const char * e = getenv("GGML_CUDA_FA_STAGE_PREALLOC");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
             char * new_arena = nullptr;
-            if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+            if (prealloc && size_hint >= size) {
+                const size_t hint_size = std::max<size_t>(size_t(1) << 24, size_hint);
+                if (cudaMalloc(&new_arena, hint_size) == cudaSuccess) {
+                    new_size = hint_size;
+                } else {
+                    (void) cudaGetLastError(); // clear the sticky error, fall back to the growth step
+                    new_arena = nullptr;
+                }
+            }
+            if (new_arena == nullptr && cudaMalloc(&new_arena, new_size) != cudaSuccess) {
                 (void) cudaGetLastError(); // clear the sticky error
                 if (!fattn_stage_oom_warned) {
                     fattn_stage_oom_warned = true;
