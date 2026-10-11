@@ -1848,40 +1848,68 @@ struct ggml_backend_cuda_context {
     // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
     // less free memory at the first deep prefill than the fit projected; failing here must degrade
     // to the native read, not kill the run.
-    void * fattn_stage_try_get(int stream_no, size_t size) {
+    //
+    // `size_hint`, when non-zero, is the eventual full size this arena will be asked for (the F16
+    // size of the K/V view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB; computed by
+    // launch_fattn).  When it is set and at least `size`, the arena is allocated once at that size
+    // instead of climbing the 1.25x growth ladder: on Windows/WDDM a freed allocation stays
+    // committed against the process, so the ladder strands roughly 5x the final arena over a deep
+    // prefill.  The hint is only honoured when it stays within the optional-allocation free cap
+    // (the slab-active guard) and is tried before the ladder, so on refusal or cudaMalloc failure
+    // the existing growth step runs -- an oversized (or unbounded) hint can never cost more than
+    // the pre-change path.  GGML_CUDA_FA_STAGE_PREALLOC=0 disables the hint (A/B and bisection).
+    void * fattn_stage_try_get(int stream_no, size_t size, size_t size_hint = 0) {
         GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
         if (size > fattn_stage_size[stream_no]) {
-            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
-            // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
-            // still leave when the movable-boundary slab is active (see
-            // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
-            if (!optional_alloc_within_free_cap(fattn_stage_bytes() - fattn_stage_size[stream_no] + new_size)) {
-                if (!fattn_stage_oom_warned) {
-                    fattn_stage_oom_warned = true;
-                    GGML_LOG_WARN("%s: leaving the FA prefill staging arena at %zu MiB rather than %zu MiB "
-                                  "(the slab is active and free VRAM is tight); reading the K/V cache "
-                                  "natively instead (prefill may be slower)\n",
-                                  __func__, fattn_stage_size[stream_no] >> 20, new_size >> 20);
-                }
-                return nullptr;
-            }
+            static const bool prealloc = []() {
+                const char * e = getenv("GGML_CUDA_FA_STAGE_PREALLOC");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            const size_t new_size  = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
+            const size_t cur_total = fattn_stage_bytes() - fattn_stage_size[stream_no];
+            size_t alloc_size = new_size;
             char * new_arena = nullptr;
-            if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
-                (void) cudaGetLastError(); // clear the sticky error
-                if (!fattn_stage_oom_warned) {
-                    fattn_stage_oom_warned = true;
-                    GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
-                                  "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
-                                  __func__, new_size >> 20);
+            if (prealloc && size_hint >= size) {
+                const size_t hint_size = std::max<size_t>(size_t(1) << 24, size_hint);
+                if (optional_alloc_within_free_cap(cur_total + hint_size)) {
+                    if (cudaMalloc(&new_arena, hint_size) == cudaSuccess) {
+                        alloc_size = hint_size;
+                    } else {
+                        (void) cudaGetLastError(); // clear the sticky error, fall back to the growth step
+                    }
                 }
-                return nullptr;
+            }
+            if (new_arena == nullptr) {
+                // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
+                // still leave when the movable-boundary slab is active (see
+                // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
+                if (!optional_alloc_within_free_cap(cur_total + new_size)) {
+                    if (!fattn_stage_oom_warned) {
+                        fattn_stage_oom_warned = true;
+                        GGML_LOG_WARN("%s: leaving the FA prefill staging arena at %zu MiB rather than %zu MiB "
+                                      "(the slab is active and free VRAM is tight); reading the K/V cache "
+                                      "natively instead (prefill may be slower)\n",
+                                      __func__, fattn_stage_size[stream_no] >> 20, new_size >> 20);
+                    }
+                    return nullptr;
+                }
+                if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+                    (void) cudaGetLastError(); // clear the sticky error
+                    if (!fattn_stage_oom_warned) {
+                        fattn_stage_oom_warned = true;
+                        GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
+                                      "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
+                                      __func__, new_size >> 20);
+                    }
+                    return nullptr;
+                }
             }
             if (fattn_stage[stream_no] != nullptr) {
                 ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old arena
                 CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
             }
             fattn_stage[stream_no]      = new_arena;
-            fattn_stage_size[stream_no] = new_size;
+            fattn_stage_size[stream_no] = alloc_size;
         }
         return fattn_stage[stream_no];
     }

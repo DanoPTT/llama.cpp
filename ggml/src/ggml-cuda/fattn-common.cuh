@@ -1964,7 +1964,21 @@ void launch_fattn(
     const bool stage_wants_K = !native_width && stage_cap_K && kv_native_K != FATTN_KV_NATIVE_NONE;
     const bool stage_wants_V = !native_width && stage_cap_V && kv_native_V != FATTN_KV_NATIVE_NONE && !V_is_K_view;
     const size_t stage_req = (stage_wants_K ? stage_bytes_K : 0) + (stage_wants_V ? stage_bytes_V : 0);
-    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req) : nullptr;
+    // Issue #138: the eventual full size of the staging arena is known from the F16 size of the K/V
+    // view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB exactly as the request is.  Passing
+    // it lets the arena allocate once instead of climbing its 1.25x growth ladder, which on
+    // Windows/WDDM strands every freed step against the process (~5x the final arena over a deep
+    // prefill).  With an unbounded cap (=0) no hint is passed: the full root can be many GiB and the
+    // ladder stays the safer growth path there.
+    size_t stage_hint = 0;
+    if (stage_req != 0 && stage_max_bytes != 0) {
+        auto full_bytes = [stage_max_bytes](const ggml_tensor * t) {
+            const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
+            return std::min((size_t) ggml_nelements(root)*sizeof(half), stage_max_bytes);
+        };
+        stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+    }
+    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
     const bool stage_ok = stage_buf != nullptr;
 
     const bool use_native_K = (native_width || !stage_ok || !stage_cap_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
