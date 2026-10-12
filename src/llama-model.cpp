@@ -354,6 +354,47 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
 
 }
 
+// gemma4's fused expert tensor (`ffn_gate_up_exps`) has a SEGMENTED split layout (n_segments/nr).
+// When the expert table is host-resident (`-ncmoe`/`-cmoe` pushes a CPU-buffer override for it),
+// the per-ubatch upload has no correct path under tensor split: ggml_backend_meta_set_tensor_async
+// only understands a contiguous single-segment slice, so the meta assert fires.  An all-resident
+// model, or one offloaded by `-ngl`/`--fit` (whole layers on the CPU backend, no per-ubatch upload),
+// is fine.  Detect the override so only the crashing configuration is rejected, with a clear message
+// instead of an assert (issue #99).
+static bool llm_params_have_host_expert_override(const llama_model_params & params) {
+    if (params.tensor_buft_overrides == nullptr) {
+        return false;
+    }
+    // Representative gemma4 expert weight names; the `-ncmoe`/`-cmoe` patterns are
+    // `...ffn_(up|down|gate|gate_up)_(ch)?exps`, which these match.
+    static const char * const probes[] = {
+        "blk.0.ffn_gate_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+    };
+    for (const llama_model_tensor_buft_override * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+        if (o->buft == nullptr) {
+            continue;
+        }
+        const ggml_backend_dev_t dev = ggml_backend_buft_get_device(o->buft);
+        const enum ggml_backend_dev_type dev_type =
+            dev == nullptr ? GGML_BACKEND_DEVICE_TYPE_CPU : ggml_backend_dev_type(dev);
+        if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;   // the expert table stays device-resident
+        }
+        try {
+            const std::regex pat(o->pattern);
+            for (const char * probe : probes) {
+                if (std::regex_search(std::string(probe), pat)) {
+                    return true;
+                }
+            }
+        } catch (const std::regex_error &) {
+            // an invalid pattern is reported by the loader; ignore it here
+        }
+    }
+    return false;
+}
+
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
     llama_model * model = llama_model_mapping(arch, params);
 
@@ -361,6 +402,12 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         model->arch = arch;
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+        }
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_GEMMA4 &&
+            llm_params_have_host_expert_override(params)) {
+            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR is not supported for gemma4 with host-resident "
+                                     "experts (-ncmoe/-cmoe): the fused expert tensor's segmented per-ubatch "
+                                     "upload has no tensor-split path -- use -sm layer for that config");
         }
     }
 
@@ -379,7 +426,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
+    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
+    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
+    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
+    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
+    // name (every activation copy) is left alone and falls through to the mirrored default below.
+    std::string tensor_name = tensor->name;
+    {
+        const size_t first = tensor_name.find('#');
+        const size_t last  = tensor_name.rfind('#');
+        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
+            bool trailing_index = true;
+            for (size_t i = last + 1; i < tensor_name.size(); i++) {
+                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
+            }
+            if (trailing_index) {
+                // wip/tensor-split-expert-split experiment gate:
+                //   0 = off (r12 behaviour: the copy stays mirrored)
+                //   1 = every weight copy inherits its weight's split
+                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
+                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
+                static const int split_copy = [] {
+                    const char * e = getenv("GGML_META_SPLIT_COPY");
+                    return e != nullptr ? atoi(e) : 1;
+                }();
+                if (split_copy != 0) {
+                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
+                    const bool is_down = stripped.find("ffn_down_exps") != std::string::npos;
+                    // 2 = keep only the axis-0 down copies mirrored; 3 = the inverse bisection:
+                    // split only the axis-0 down copies, leave gate/up mirrored (tests the reduce path
+                    // in isolation).
+                    const bool axis0_only = split_copy == 2 && is_down;
+                    const bool down_only  = split_copy == 3 && !is_down;
+                    if (!axis0_only && !down_only) {
+                        tensor_name = stripped;
+                    }
+                }
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -1602,9 +1688,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1807,6 +1905,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml.moe_host_expert_bytes;
 
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
@@ -2031,6 +2132,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
 }
 
 uint64_t llama_model::n_elements() const {
@@ -2492,6 +2613,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* n_rs_batch        */ cparams.n_rs_batch,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
@@ -2665,10 +2787,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
+                // its MTP context gets an indexer cache instead of a plain KV cache.
+                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
+                // graph_mtp reads the same env, so the memory type and the graph routing cannot
+                // disagree.
+                static const bool mtp_sparse = [] {
+                    const char * env = getenv("LLAMA_MTP_SPARSE");
+                    return env == nullptr || std::atoi(env) != 0;
+                }();
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && (!mtp_sparse || hparams.indexer_head_size == 0)));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_sparse && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* n_rs_batch        */ cparams.n_rs_batch,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2682,6 +2845,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            cparams.n_rs_batch,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
@@ -2743,6 +2907,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2763,6 +2928,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2783,6 +2949,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -2930,6 +3097,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2941,6 +3109,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.allow_nextn_cpu_offload     =*/ false,
     };
 
     return result;
@@ -3361,6 +3530,72 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
+    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
+    const size_t max_host_table = model->max_host_weight_tensor_bytes();
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes, max_host_table);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+}
+
+int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
+    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
+}
+
+bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                     ggml_backend_dev_t * dev, size_t * bytes) {
+    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
+        return false;
+    }
+    auto it = model->moe_host_expert_bytes.begin();
+    std::advance(it, i);
+    if (dev   != nullptr) { *dev   = it->first;  }
+    if (bytes != nullptr) { *bytes = it->second; }
+    return true;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
@@ -3386,7 +3621,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_SKIP_MANAGED   (llama_model_loader::TENSOR_SKIP_MANAGED) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
