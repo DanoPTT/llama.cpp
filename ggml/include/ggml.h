@@ -2810,6 +2810,7 @@ extern "C" {
     // n_rs_batch is the largest per-seq batch that can be rolled back into (0 = unset). Backends
     // with a chunked prefill kernel may skip writing the snapshots for a batch above this bound,
     // because such a batch is never rolled back into.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
