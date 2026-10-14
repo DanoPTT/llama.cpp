@@ -85,6 +85,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/ggml-cuda-try-fuse.cuh"
 #include "ggml.h"
 #include <algorithm>
 #include <numeric>
