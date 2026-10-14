@@ -385,7 +385,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
+    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
+    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
+    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
+    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
+    // name (every activation copy) is left alone and falls through to the mirrored default below.
+    std::string tensor_name = tensor->name;
+    {
+        const size_t first = tensor_name.find('#');
+        const size_t last  = tensor_name.rfind('#');
+        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
+            bool trailing_index = true;
+            for (size_t i = last + 1; i < tensor_name.size(); i++) {
+                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
+            }
+            if (trailing_index) {
+                // wip/tensor-split-expert-split experiment gate:
+                //   0 = off (r12 behaviour: the copy stays mirrored)
+                //   1 = every weight copy inherits its weight's split
+                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
+                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
+                static const int split_copy = [] {
+                    const char * e = getenv("GGML_META_SPLIT_COPY");
+                    return e != nullptr ? atoi(e) : 1;
+                }();
+                if (split_copy != 0) {
+                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
+                    const bool is_down = stripped.find("ffn_down_exps") != std::string::npos;
+                    // 2 = keep only the axis-0 down copies mirrored; 3 = the inverse bisection:
+                    // split only the axis-0 down copies, leave gate/up mirrored (tests the reduce path
+                    // in isolation).
+                    const bool axis0_only = split_copy == 2 && is_down;
+                    const bool down_only  = split_copy == 3 && !is_down;
+                    if (!axis0_only && !down_only) {
+                        tensor_name = stripped;
+                    }
+                }
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -1333,13 +1372,13 @@ llama_model::~llama_model() {
     }
 }
 
-void llama_model_base::load_stats(llama_model_loader & ml) {
-    pimpl->n_elements = ml.n_elements;
-    pimpl->n_bytes = ml.n_bytes;
+void llama_model_base::load_stats(llama_model_loader & ml_l) {
+    pimpl->n_elements = ml_l.n_elements;
+    pimpl->n_bytes = ml_l.n_bytes;
 }
 
-void llama_model_base::load_hparams(llama_model_loader & ml) {
-    const gguf_context * ctx = ml.metadata;
+void llama_model_base::load_hparams(llama_model_loader & ml_l) {
+    const gguf_context * ctx = ml_l.metadata;
 
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
@@ -1352,38 +1391,38 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         gguf_kv.emplace(name, value);
     }
 
-    load_hparams_hadamard(ml);
+    load_hparams_hadamard(ml_l);
 
     // get general kv
-    ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+    ml_l.get_key(LLM_KV_GENERAL_NAME, name, false);
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
-    if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {
+    if (hparams.vocab_only || ml_l.get_arch() == LLM_ARCH_CLIP) {
         return;
     }
 
-    ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
-    ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
-    ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
-    ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
-    ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
-    ml.get_key(LLM_KV_CLASSIFIER_POOLING_TYPE, hparams.pooling_type_cls, false);
+    ml_l.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
+    ml_l.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
+    ml_l.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
+    ml_l.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
+    ml_l.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
+    ml_l.get_key(LLM_KV_CLASSIFIER_POOLING_TYPE, hparams.pooling_type_cls, false);
     std::string act_cls;
-    if (ml.get_key(LLM_KV_CLASSIFIER_ACTIVATION, act_cls, false)) {
+    if (ml_l.get_key(LLM_KV_CLASSIFIER_ACTIVATION, act_cls, false)) {
         const auto it = LLM_CLS_ACT_TYPES_FROM_STRING.find(act_cls);
         GGML_ASSERT(it != LLM_CLS_ACT_TYPES_FROM_STRING.end() && "unsupported classifier activation");
         hparams.act_cls = it->second;
     }
-    ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
+    ml_l.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
+    ml_l.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer_all);
-    ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+    ml_l.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
-    ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
-    ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
-    ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
+    ml_l.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
+    ml_l.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
+    ml_l.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
     if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
         if (hparams.n_expert <= 1) {
@@ -1393,14 +1432,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
-        ml.get_key(LLM_KV_FEATURES_LENGTH,  hparams.n_embd);
-        ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd_out_impl);
+        ml_l.get_key(LLM_KV_FEATURES_LENGTH,  hparams.n_embd);
+        ml_l.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd_out_impl);
 
-        ml.get_key(LLM_KV_POSNET_EMBEDDING_LENGTH, hparams.posnet.n_embd);
-        ml.get_key(LLM_KV_POSNET_BLOCK_COUNT,      hparams.posnet.n_layer);
+        ml_l.get_key(LLM_KV_POSNET_EMBEDDING_LENGTH, hparams.posnet.n_embd);
+        ml_l.get_key(LLM_KV_POSNET_BLOCK_COUNT,      hparams.posnet.n_layer);
 
-        ml.get_key(LLM_KV_CONVNEXT_EMBEDDING_LENGTH, hparams.convnext.n_embd);
-        ml.get_key(LLM_KV_CONVNEXT_BLOCK_COUNT,      hparams.convnext.n_layer);
+        ml_l.get_key(LLM_KV_CONVNEXT_EMBEDDING_LENGTH, hparams.convnext.n_embd);
+        ml_l.get_key(LLM_KV_CONVNEXT_BLOCK_COUNT,      hparams.convnext.n_layer);
 
         GGML_ASSERT(hparams.posnet.n_layer   <= hparams.n_layer_all);
         GGML_ASSERT(hparams.convnext.n_layer <= hparams.n_layer_all);
@@ -1432,7 +1471,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.rope_pattern.begin(),  hparams.rope_pattern.end(), 1);
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
-    std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
+    std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml_l.get_arch()) ? 1 : 0);
     std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
@@ -1443,8 +1482,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
+    ml_l.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer_all, false);
+    ml_l.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer_all, false);
 
     // Populate deepstack_mapping_arr - initialized to -1 (no deepstack)
     std::fill(hparams.deepstack_mapping_arr.begin(), hparams.deepstack_mapping_arr.end(), -1);
@@ -1452,26 +1491,26 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
+    ml_l.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
 
     bool rope_finetuned = false;
-    ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
+    ml_l.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
 
     hparams.n_ctx_orig_yarn = hparams.n_ctx_train;
-    ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
+    ml_l.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
 
     // rope_freq_base (optional)
     hparams.rope_freq_base_train = 10000.0f;
-    ml.get_key(LLM_KV_ROPE_FREQ_BASE, hparams.rope_freq_base_train, false);
+    ml_l.get_key(LLM_KV_ROPE_FREQ_BASE, hparams.rope_freq_base_train, false);
 
     std::string rope_scaling("linear");
-    ml.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false);
+    ml_l.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false);
     hparams.rope_scaling_type_train = llama_rope_scaling_type_from_string(rope_scaling);
     GGML_ASSERT(hparams.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED);
 
     std::string rope_section_order("tyxz");
-    ml.get_key(LLM_KV_ROPE_SECTION_ORDER, rope_section_order, false);
+    ml_l.get_key(LLM_KV_ROPE_SECTION_ORDER, rope_section_order, false);
     hparams.rope_section_order = llama_rope_section_order_from_string(rope_section_order);
     if (hparams.rope_section_order == LLAMA_ROPE_SECTION_ORDER_UNSPECIFIED) {
         throw std::runtime_error("unknown rope section order: " + rope_section_order);
@@ -1480,14 +1519,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // TODO: Handle SWA metadata similarly when models start implementing it
     // rope_freq_scale (inverse of the kv) is optional
     float ropescale = 0.0f;
-    if (!ml.get_key(LLM_KV_ROPE_SCALING_FACTOR, ropescale, false)) {
+    if (!ml_l.get_key(LLM_KV_ROPE_SCALING_FACTOR, ropescale, false)) {
         // try the old key name
-        ml.get_key(LLM_KV_ROPE_SCALE_LINEAR, ropescale, false);
+        ml_l.get_key(LLM_KV_ROPE_SCALE_LINEAR, ropescale, false);
     }
     hparams.rope_freq_scale_train = ropescale == 0.0f ? 1.0f : 1.0f/ropescale;
 
-    ml.get_key(LLM_KV_ROPE_SCALING_ATTN_FACTOR, hparams.rope_attn_factor, false);
-    ml.get_key(LLM_KV_ROPE_SCALING_ALPHA,       hparams.rope_scaling_alpha, false);
+    ml_l.get_key(LLM_KV_ROPE_SCALING_ATTN_FACTOR, hparams.rope_attn_factor, false);
+    ml_l.get_key(LLM_KV_ROPE_SCALING_ALPHA,       hparams.rope_scaling_alpha, false);
 
     // non-transformer models do not have attention heads
     if (hparams.n_head() > 0) {
@@ -1495,15 +1534,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         // gpt-j n_rot = rotary_dim
 
         hparams.n_embd_head_k_full = hparams.n_embd / hparams.n_head();
-        ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH, hparams.n_embd_head_k_full, false);
+        ml_l.get_key(LLM_KV_ATTENTION_KEY_LENGTH, hparams.n_embd_head_k_full, false);
 
         hparams.n_embd_head_v_full = hparams.n_embd / hparams.n_head();
-        ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v_full, false);
+        ml_l.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v_full, false);
 
         // sanity check for n_rot (optional)
         hparams.n_rot_full = hparams.n_embd_head_k_full;
 
-        ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot_full, false);
+        ml_l.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot_full, false);
 
         if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON || arch == LLM_ARCH_LLAMA_EMBED) {
             if (hparams.n_rot_full != hparams.n_embd_head_k_full) {
@@ -1520,27 +1559,27 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     {
         hparams.n_embd_head_k_swa = hparams.n_embd_head_k_full;
         hparams.n_embd_head_v_swa = hparams.n_embd_head_v_full;
-        ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA, hparams.n_embd_head_k_swa, false);
-        ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, hparams.n_embd_head_v_swa, false);
+        ml_l.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA, hparams.n_embd_head_k_swa, false);
+        ml_l.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, hparams.n_embd_head_v_swa, false);
 
         hparams.n_rot_swa = hparams.n_rot_full;
-        ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
+        ml_l.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, hparams.n_rot_swa, false);
     }
 
     // for classifier models
-    ml.get_arr(LLM_KV_CLASSIFIER_OUTPUT_LABELS, classifier_labels, false);
+    ml_l.get_arr(LLM_KV_CLASSIFIER_OUTPUT_LABELS, classifier_labels, false);
     if (!classifier_labels.empty()) {
         hparams.n_cls_out = classifier_labels.size();
     }
 
     // per-arch hparams
-    load_arch_hparams(ml);
+    load_arch_hparams(ml_l);
 
-    pimpl->n_bytes = ml.n_bytes;
+    pimpl->n_bytes = ml_l.n_bytes;
 
-    pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+    pimpl->desc_str = arch_name() + " " + type_name() + " " + ml_l.ftype_name();
 
-    pimpl->ftype = ml.ftype;
+    pimpl->ftype = ml_l.ftype;
 
     if (hparams.f_max_alibi_bias > 0.0f) {
         hparams.use_alibi = true;
@@ -1553,13 +1592,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_base::load_vocab(llama_model_loader & ml) {
+void llama_model_base::load_vocab(llama_model_loader & ml_l) {
     const auto kv = LLM_KV(arch);
 
-    vocab.load(ml, kv);
+    vocab.load(ml_l, kv);
 }
 
-bool llama_model_base::load_tensors(llama_model_loader & ml) {
+bool llama_model_base::load_tensors(llama_model_loader & ml_l) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
@@ -1569,33 +1608,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
-    this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+    this->ml = &ml_l; // to be used by create_tensor() and load_arch_tensors()
 
-    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+    if (ml_l.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
-                ml.use_mmap = false;
+                ml_l.use_mmap = false;
                 break;
             }
         }
     }
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+    if (ml_l.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                ml_l.lazy.mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
     }
 
     const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
-        ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
+        ? llama_load_mode_name(ml_l.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
         : llama_load_mode_name(params.load_mode);
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
@@ -1662,9 +1701,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1675,12 +1726,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
-    const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
-
     // create tensors for the weights
     {
         // TODO: move to a separate function
-        const auto tn = LLM_TN(arch);
+        const auto tn_l = LLM_TN(arch);
 
         const int64_t n_expert = hparams.n_expert;
 
@@ -1691,7 +1740,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         layers.resize(n_layer_all);
 
         // call the per-model loading function
-        load_arch_tensors(ml);
+        load_arch_tensors(ml_l);
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
@@ -1700,156 +1749,156 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
-                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wq_s = create_tensor(tn_l(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wk_s && layer.wk) {
-                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_s = create_tensor(tn_l(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wv_s && layer.wv) {
-                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_s = create_tensor(tn_l(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_s && layer.wo) {
-                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_s = create_tensor(tn_l(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_s && layer.wqkv) {
-                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_s = create_tensor(tn_l(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_gate_s && layer.wqkv_gate) {
-                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_s = create_tensor(tn_l(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
             // dense FFN weight scales (per-tensor, shape {1})
             if (!layer.ffn_gate_s && layer.ffn_gate) {
-                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_s && layer.ffn_down) {
-                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_s && layer.ffn_up) {
-                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_shexp_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
             // MoE expert weight scales (per-expert, shape {n_expert})
             if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
             if (!layer.ssm_in_s && layer.ssm_in) {
-                layer.ssm_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_s = create_tensor(tn_l(LLM_TENSOR_SSM_IN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_out_s && layer.ssm_out) {
-                layer.ssm_out_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_s = create_tensor(tn_l(LLM_TENSOR_SSM_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_alpha_s && layer.ssm_alpha) {
-                layer.ssm_alpha_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_s = create_tensor(tn_l(LLM_TENSOR_SSM_ALPHA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_beta_s && layer.ssm_beta) {
-                layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_s = create_tensor(tn_l(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_s = create_tensor(tn_l(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_s = create_tensor(tn_l(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
 
             // input scales
             if (!layer.wq_in_s && layer.wq) {
-                layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wq_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_Q,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wk_in_s && layer.wk) {
-                layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_K,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wv_in_s && layer.wv) {
-                layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_V,   "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wo_in_s && layer.wo) {
-                layer.wo_in_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_in_s && layer.wqkv) {
-                layer.wqkv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_QKV, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.wqkv_gate_in_s && layer.wqkv_gate) {
-                layer.wqkv_gate_in_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_in_s = create_tensor(tn_l(LLM_TENSOR_ATTN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_in_s && layer.ffn_gate) {
-                layer.ffn_gate_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_in_s && layer.ffn_down) {
-                layer.ffn_down_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_in_s && layer.ffn_up) {
-                layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_down_shexp_in_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_up_shexp_in_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_in_s = create_tensor(tn_l(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_in_in_s && layer.ssm_in) {
-                layer.ssm_in_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_in_s = create_tensor(tn_l(LLM_TENSOR_SSM_IN, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_out_in_s && layer.ssm_out) {
-                layer.ssm_out_in_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_in_s = create_tensor(tn_l(LLM_TENSOR_SSM_OUT, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_alpha_in_s && layer.ssm_alpha) {
-                layer.ssm_alpha_in_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_in_s = create_tensor(tn_l(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
-                layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_in_s = create_tensor(tn_l(LLM_TENSOR_SSM_BETA, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_in_s = create_tensor(tn_l(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_in_s = create_tensor(tn_l(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
         // output scales
         if (output && output->type == GGML_TYPE_NVFP4) {
             // weight scale
             if (!output_s) {
-                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+                output_s = create_tensor(tn_l(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
             }
             // input scale
             if (!output_in_s) {
-                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+                output_in_s = create_tensor(tn_l(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
             }
         }
     }
 
-    ml.done_getting_tensors();
+    ml_l.done_getting_tensors();
 
-    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+    if (per_layer_tok_embd && ml_l.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
         can_prefetch.insert(per_layer_tok_embd);
@@ -1862,27 +1911,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             output->type == GGML_TYPE_NVFP4 &&
             (output_s || output_in_s)));
     // populate tensors_by_name
-    for (auto & [_, ctx_ptr] : ml.ctx_map) {
+    for (auto & [_, ctx_ptr] : ml_l.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
 
-    // per-tensor activation precision policy
-    prec_policy.load(ml, *this);
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml_l.moe_host_expert_bytes;
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-    pimpl->mappings.reserve(ml.mappings.size());
+    // per-tensor activation precision policy
+    prec_policy.load(ml_l, *this);
+
+    ml_l.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    pimpl->mappings.reserve(ml_l.mappings.size());
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
+    ctx_buf_maps.reserve(ml_l.ctx_map.size());
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
-    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+    const size_t n_max_backend_buffer = ml_l.ctx_map.size() * ml_l.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+    for (auto & [ctx_key, ctx_ptr] : ml_l.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
@@ -1911,18 +1963,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
-        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        const bool is_lazy_mapped = ctx_key.lazy && !ml_l.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
-            GGML_ASSERT(!ml.no_alloc);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+        if ((ml_l.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+            GGML_ASSERT(!ml_l.no_alloc);
+            for (uint32_t idx = 0; idx < ml_l.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
                 void * addr = nullptr;
                 size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                ml_l.get_mapping_range(&first, &last, &addr, idx, ctx);
                 if (first >= last) {
                     continue;
                 }
@@ -1933,10 +1985,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+
+                // record the exact mmap-backed ranges before any data is loaded, so the loader's
+                // per-tensor release never unmaps pages that a host-pointer tensor points into
+                // (a tied embedding is loaded once mmap-backed and once copied to a device)
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    const auto * w = ml_l.get_weight(ggml_get_name(t));
+                    if (w != nullptr && (uint32_t) w->idx == idx) {
+                        ml_l.mark_mmap_used(idx, w->offs, ggml_nbytes(t));
+                    }
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml_l.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -1954,7 +2016,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
             bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+            for (uint32_t idx = 0; idx < ml_l.files.size(); idx++) {
                 buf_map.emplace(idx, buf);
             }
         }
@@ -1994,12 +2056,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (ml.no_alloc) {
+    if (ml_l.no_alloc) {
         return true;
     }
 
     // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
-    if (!ml.use_mmap) {
+    if (!ml_l.use_mmap) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
             const auto & buf_map = ctx_buf_map.second;
             return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
@@ -2008,13 +2070,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml_l.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
+        for (auto & mapping : ml_l.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
@@ -2025,10 +2087,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
-void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+void llama_model_base::load_hparams_hadamard(llama_model_loader & ml_l) {
     uint32_t hadamard_version = 0;
-    ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
-    if (ml.get_key(LLM_KV_PRISM_HADAMARD_VERSION, hadamard_version, false)) {
+    ml_l.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
+    if (ml_l.get_key(LLM_KV_PRISM_HADAMARD_VERSION, hadamard_version, false)) {
         if (hadamard_version != 1 && hadamard_version != 2) {
             throw std::runtime_error(format("unsupported prism.hadamard.version: %u", hadamard_version));
         }
@@ -2036,7 +2098,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         if ((hadamard_version == 2) != hdmd.tied_output) {
             throw std::runtime_error("prism.hadamard version 2 requires tied_output=true; version 1 forbids it");
         }
-        if (hdmd.tied_output && ml.get_weight("output.weight")) {
+        if (hdmd.tied_output && ml_l.get_weight("output.weight")) {
             throw std::runtime_error("prism.hadamard.tied_output requires output.weight to be absent");
         }
 
@@ -2046,11 +2108,11 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         std::string sign_mode;
         std::vector<std::string> weight_names;
 
-        ml.get_key(LLM_KV_PRISM_HADAMARD_BLOCK_SIZE, block_size);
-        ml.get_key(LLM_KV_PRISM_HADAMARD_TRANSFORM, transform);
-        ml.get_key(LLM_KV_PRISM_HADAMARD_AXIS, axis);
-        ml.get_key(LLM_KV_PRISM_HADAMARD_SIGN_MODE, sign_mode);
-        ml.get_arr(LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES, weight_names);
+        ml_l.get_key(LLM_KV_PRISM_HADAMARD_BLOCK_SIZE, block_size);
+        ml_l.get_key(LLM_KV_PRISM_HADAMARD_TRANSFORM, transform);
+        ml_l.get_key(LLM_KV_PRISM_HADAMARD_AXIS, axis);
+        ml_l.get_key(LLM_KV_PRISM_HADAMARD_SIGN_MODE, sign_mode);
+        ml_l.get_arr(LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES, weight_names);
 
         if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
             throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
@@ -2071,8 +2133,8 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
         if (sign_mode == "explicit") {
             std::vector<int32_t> sign_widths;
             std::vector<int32_t> sign_values;
-            ml.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_WIDTHS, sign_widths);
-            ml.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_VALUES, sign_values);
+            ml_l.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_WIDTHS, sign_widths);
+            ml_l.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_VALUES, sign_values);
             // explicit mode with no widths gives an empty sign table, which acts as identity and changes the model
             if (sign_widths.empty()) {
                 throw std::runtime_error("prism.hadamard.sign_mode is explicit but sign_widths is empty");
@@ -2099,7 +2161,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             }
         }
 
-        ml.get_key(LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED, hdmd.gdn_v_grouped, false);
+        ml_l.get_key(LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED, hdmd.gdn_v_grouped, false);
 
         // only build_lora_mm/build_lora_mm_id apply the transform: refuse archs and tensor kinds that can skip them
         switch (arch) {
@@ -2161,7 +2223,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
 
         // tables read by row lookup store latent rows: the inverse transform goes on the lookup result
         std::vector<std::string> inverse_names;
-        ml.get_arr(LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, inverse_names, false);
+        ml_l.get_arr(LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, inverse_names, false);
         for (const auto & name : inverse_names) {
             // the graph applies the inverse only after the token-embedding lookup, other latent tables stay rotated
             if (name != "token_embd.weight") {
@@ -2183,7 +2245,7 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
             throw std::runtime_error("prism.hadamard.tied_output requires a latent token embedding");
         }
         hdmd.weight_blocks.emplace("token_embd.weight", it->second);
-    } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
+    } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml_l.get_weight("output.weight")) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
 }
@@ -2355,15 +2417,15 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
-ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml_l, const LLM_TN_IMPL & tn_l, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = nullptr;
-    if (tn.bid != -1) {
+    if (tn_l.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
-        buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
+        buft_list_layer = (size_t) tn_l.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn_l.bid).buft_list : pimpl->dev_output.buft_list;
     }
-    return ml.create_tensor(
+    return ml_l.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn_l, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -2424,6 +2486,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
 }
 
 uint64_t llama_model::n_elements() const {
@@ -2716,10 +2798,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
-const ggml_tensor * llama_model::get_tensor(const char * name) const {
+const ggml_tensor * llama_model::get_tensor(const char * name_l) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
-            [name](const std::pair<std::string, ggml_tensor *> & it) {
-                return it.first == name;
+            [name_l](const std::pair<std::string, ggml_tensor *> & it) {
+                return it.first == name_l;
             });
     if (it == tensors_by_name.end()) {
         return nullptr;
@@ -2751,7 +2833,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
     // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
@@ -2789,8 +2871,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 res = new llama_kv_cache_msa(
                         *this,
-                        params.type_k,
-                        params.type_v,
+                        params_l.type_k,
+                        params_l.type_v,
                         !cparams.flash_attn,
                         cparams.offload_kqv,
                         cparams.kv_unified,
@@ -2806,7 +2888,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
             {
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
                     // MTP context uses a plain attention KV cache holding only the
                     // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
@@ -2816,8 +2898,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     res = new llama_kv_cache(
                             *this,
                             hparams,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
@@ -2841,8 +2923,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
@@ -2871,7 +2953,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 };
 
                 // the draft head is a single DSA layer
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     if (hparams.n_layer_nextn == 0) {
                         throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
                     }
@@ -2882,8 +2964,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
-                    /* attn_type_k       */ params.type_k,
-                    /* attn_type_v       */ params.type_v,
+                    /* attn_type_k       */ params_l.type_k,
+                    /* attn_type_v       */ params_l.type_v,
                     /* attn_v_trans      */ !cparams.flash_attn,
                     /* attn_kv_size      */ cparams.n_ctx_seq,
                     /* attn_n_pad        */ 1,
@@ -2894,6 +2976,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* n_rs_batch        */ cparams.n_rs_batch,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
@@ -2907,8 +2990,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     res = new llama_kv_cache(
                             *this,
                             hparams,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
@@ -2927,8 +3010,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
@@ -2946,7 +3029,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
                     // MTP draft context: plain attention KV cache holding only the nextn layer
                     llama_kv_cache::layer_filter_cb filter =
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
@@ -2954,8 +3037,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     res = new llama_kv_cache(
                             *this,
                             hparams,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
@@ -2978,11 +3061,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_dsa_iswa(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
-                            params.swa_full,
+                            params_l.swa_full,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
@@ -2997,18 +3080,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                     const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
                         return il >= (int32_t) hparams.n_layer();
                     };
 
                     res = new llama_kv_cache_iswa(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
-                            params.swa_full,
+                            params_l.swa_full,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
@@ -3021,11 +3104,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
-                            params.swa_full,
+                            params_l.swa_full,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
@@ -3044,11 +3127,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     res = new llama_kv_cache_iswa(
                             *this,
-                            params.type_k,
-                            params.type_v,
+                            params_l.type_k,
+                            params_l.type_v,
                             !cparams.flash_attn,
                             cparams.offload_kqv,
-                            params.swa_full,
+                            params_l.swa_full,
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
@@ -3067,13 +3150,54 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
+                // its MTP context gets an indexer cache instead of a plain KV cache.
+                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
+                // graph_mtp reads the same env, so the memory type and the graph routing cannot
+                // disagree.
+                static const bool mtp_sparse = [] {
+                    const char * env = getenv("LLAMA_MTP_SPARSE");
+                    return env == nullptr || std::atoi(env) != 0;
+                }();
                 const bool mtp_on_hybrid_qwen =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && (!mtp_sparse || hparams.indexer_head_size == 0)));
+
+                if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_sparse && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params_l.type_k,
+                        /* attn_type_v       */ params_l.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* n_rs_batch        */ cparams.n_rs_batch,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+                    params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -3084,6 +3208,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            cparams.n_rs_batch,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
@@ -3120,7 +3245,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
 
                         // the MTP draft context holds the MTP block alone: its attention and indexer, no recurrent layer
-                        if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        if (arch == LLM_ARCH_QWEN4EXP && params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
                             if (filter_idx) {
@@ -3133,10 +3258,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
+                            /* attn_type_k       */ params_l.type_k,
+                            /* attn_type_v       */ params_l.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_swa_full     */ params.swa_full,
+                            /* attn_swa_full     */ params_l.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
@@ -3145,6 +3270,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -3153,8 +3279,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
+                            /* attn_type_k       */ params_l.type_k,
+                            /* attn_type_v       */ params_l.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
@@ -3165,6 +3291,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -3173,8 +3300,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
+                            /* attn_type_k       */ params_l.type_k,
+                            /* attn_type_v       */ params_l.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
@@ -3185,6 +3312,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -3214,7 +3342,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
                     // or when a model is entirely n_layer_nextn layers and has no trunk
                     if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
-                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
@@ -3239,11 +3367,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    params.type_k,
-                                    params.type_v,
+                                    params_l.type_k,
+                                    params_l.type_v,
                                     !cparams.flash_attn,
                                     cparams.offload_kqv,
-                                    params.swa_full,
+                                    params_l.swa_full,
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
@@ -3256,11 +3384,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
-                                    params.type_k,
-                                    params.type_v,
+                                    params_l.type_k,
+                                    params_l.type_v,
                                     !cparams.flash_attn,
                                     cparams.offload_kqv,
-                                    params.swa_full,
+                                    params_l.swa_full,
                                     cparams.kv_unified,
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
@@ -3277,8 +3405,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
-                                params.type_k,
-                                params.type_v,
+                                params_l.type_k,
+                                params_l.type_v,
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
@@ -3299,8 +3427,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
-ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
-    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+ggml_cgraph * llama_model::build_graph(const llm_graph_params & params_l) const {
+    std::unique_ptr<llm_graph_context> llm = build_arch_graph(params_l);
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
@@ -3314,7 +3442,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    llm->res->set_outputs(params);
+    llm->res->set_outputs(params_l);
 
     return llm->res->get_gf();
 }
@@ -3332,6 +3460,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3343,6 +3472,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.allow_nextn_cpu_offload     =*/ false,
     };
 
     return result;
@@ -3766,6 +3896,72 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
+    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
+    const size_t max_host_table = model->max_host_weight_tensor_bytes();
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes, max_host_table);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+}
+
+int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
+    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
+}
+
+bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                     ggml_backend_dev_t * dev, size_t * bytes) {
+    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
+        return false;
+    }
+    auto it = model->moe_host_expert_bytes.begin();
+    std::advance(it, i);
+    if (dev   != nullptr) { *dev   = it->first;  }
+    if (bytes != nullptr) { *bytes = it->second; }
+    return true;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
@@ -3791,11 +3987,12 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_SKIP_MANAGED   (llama_model_loader::TENSOR_SKIP_MANAGED) {}
 
-ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn_l, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
-    return create_tensor(*ml, tn, ne, flags);
+    return create_tensor(*ml, tn_l, ne, flags);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
@@ -3853,33 +4050,33 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     }
 }
 
-llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe) const {
+llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader & ml_l, llm_tensor trunk_probe) const {
     int trunk = 0;
     int mtp   = 0;
 
     // a file without the first trunk layer is MTP-only, a file without the first NextN layer is trunk-only
     if (hparams.n_layer_nextn > 0) {
-        if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
+        if (ml_l.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+        if (ml_l.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }
 
-    if (!ml.load_mtp) {
+    if (!ml_l.load_mtp) {
         mtp |= TENSOR_SKIP;
     }
 
     return { trunk, mtp };
 }
 
-void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {
-    if (ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
+void llama_model_base::load_swa_pattern(llama_model_loader & ml_l, uint32_t n_pattern, bool dense_first) {
+    if (ml_l.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
         return;
     }
 
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern, false);
+    ml_l.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern, false);
     hparams.set_swa_pattern(n_pattern, dense_first);
 }
 
