@@ -2438,6 +2438,7 @@ static int64_t g_ev_rest_us = 0;   // the main node loop + evaluate_and_capture'
 static int64_t g_fuse_us = 0;      // inside ggml_cuda_try_fuse
 static int64_t g_fwd_us = 0;       // inside ggml_cuda_compute_forward
 static int64_t g_fuse_calls = 0, g_fwd_calls = 0, g_loop_start = 0;
+static int64_t g_gdnchk_us = 0, g_gdnchk_calls = 0; // ggml_cuda_gdn_state_gather_deferrable (+ index build)
 // per-op-type attribution of the forward cost
 // MUL_MAT branch attribution: which branch of ggml_cuda_mul_mat, and how long its call takes.
 // The remainder of the op's time is its own predicate chain (should_use_mmvf/mmf/mmvq/mmq, mmb).
@@ -2487,9 +2488,10 @@ static void g_cgc_dump(void) {
         }
         fprintf(stderr, "\n");
     }
-    fprintf(stderr, "CUDAGC_BREAK pre=%.1fms ev_pre=%.1fms ev_rest=%.1fms | fuse=%.1fms/%lld fwd=%.1fms/%lld\n",
+    fprintf(stderr, "CUDAGC_BREAK pre=%.1fms ev_pre=%.1fms ev_rest=%.1fms | fuse=%.1fms/%lld fwd=%.1fms/%lld gdnchk=%.1fms/%lld\n",
         g_gc_pre_us/1000.0, g_ev_pre_us/1000.0, g_ev_rest_us/1000.0,
-        g_fuse_us/1000.0, (long long) g_fuse_calls, g_fwd_us/1000.0, (long long) g_fwd_calls);
+        g_fuse_us/1000.0, (long long) g_fuse_calls, g_fwd_us/1000.0, (long long) g_fwd_calls,
+        g_gdnchk_us/1000.0, (long long) g_gdnchk_calls);
 }
 struct cuda_gc_timer {
     int64_t t0; ggml_cgraph * cg;
@@ -4188,6 +4190,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static const bool fuse_gdn_state_gather =
                 (getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_STATE_GATHER")) != 0) &&
                 (getenv("GGML_CUDA_DISABLE_FUSION") == nullptr || atoi(getenv("GGML_CUDA_DISABLE_FUSION")) == 0);
+            // GGML_CUDA_GDN_GATHER_INDEX=0: per-gather walk instead of the per-graph index (A/B);
+            // =2: both, abort on a different answer
+            static const int gdn_gather_index_mode =
+                getenv("GGML_CUDA_GDN_GATHER_INDEX") ? atoi(getenv("GGML_CUDA_GDN_GATHER_INDEX")) : 1;
+            ggml_cuda_gdn_gather_index gdn_gather_index;
             cuda_ctx->gdn_deferred_gathers.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -4231,9 +4238,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (fuse_gdn_state_gather && node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_deferrable(cgraph, i)) {
-                    cuda_ctx->gdn_deferred_gathers.push_back(node);
-                    continue;
+                if (fuse_gdn_state_gather && node->op == GGML_OP_GET_ROWS) {
+                    const int64_t t_g = g_cgc_on ? ggml_time_us() : 0;
+                    bool deferrable;
+                    if (gdn_gather_index_mode == 0) {
+                        deferrable = ggml_cuda_gdn_state_gather_deferrable(cgraph, i);
+                    } else {
+                        if (!gdn_gather_index.built) {
+                            ggml_cuda_gdn_gather_index_build(cgraph, gdn_gather_index);
+                        }
+                        deferrable = ggml_cuda_gdn_state_gather_deferrable(cgraph, i, gdn_gather_index);
+                        if (gdn_gather_index_mode == 2 && deferrable != ggml_cuda_gdn_state_gather_deferrable(cgraph, i)) {
+                            GGML_ABORT("GDN gather index mismatch at node %d (%s): index %d, walk %d",
+                                       i, node->name, (int) deferrable, (int) !deferrable);
+                        }
+                    }
+                    if (t_g) { g_gdnchk_us += ggml_time_us() - t_g; g_gdnchk_calls++; }
+                    if (deferrable) {
+                        cuda_ctx->gdn_deferred_gathers.push_back(node);
+                        continue;
+                    }
                 }
 
                 if (op_timing) {

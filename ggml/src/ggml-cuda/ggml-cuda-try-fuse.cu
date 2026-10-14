@@ -338,26 +338,46 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // in this graph, in the decode/verify band (single sequence, <= 16 tokens: the sequential kernel), every other reader
 // of the gathered rows is empty (the zero-row extra-states copy of a single sequence), and no node in between writes
 // the cache tensor.
-bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * gr = cgraph->nodes[node_idx];
+static const ggml_tensor * gdn_gather_root_of(const ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+// the gather-side conditions: the cache root, or nullptr when the gather does not qualify
+static const ggml_tensor * gdn_gather_candidate(const ggml_tensor * gr) {
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
         gr->src[0]->type != GGML_TYPE_F32 || gr->src[0]->nb[0] != sizeof(float) || gr->src[0]->ne[0] != gr->ne[0] ||
         gr->src[1]->type != GGML_TYPE_I32 || gr->src[1]->nb[0] != sizeof(int32_t) || !ggml_is_contiguous(gr)) {
-        return false;
+        return nullptr;
     }
-
-    auto root_of = [](const ggml_tensor * t) {
-        while (t != nullptr && t->view_src != nullptr) {
-            t = t->view_src;
-        }
-        return t;
-    };
-    const ggml_tensor * cache_root = root_of(gr->src[0]);
-
     // the row ids are read when the GDN runs, so they must outlive the gather: graph outputs are never reused
-    if (!(root_of(gr->src[1])->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (!(gdn_gather_root_of(gr->src[1])->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    return gdn_gather_root_of(gr->src[0]);
+}
+
+// the GDN-side conditions
+static bool gdn_gather_gdn_ok(const ggml_tensor * gr, const ggml_tensor * gdn) {
+    if (gdn == nullptr || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
+
+    const ggml_tensor * src_v = gdn->src[2];
+    const ggml_tensor * state = gdn->src[5];
+    return src_v->ne[2] <= 16 && src_v->ne[3] == 1 && state->data == gr->data &&
+           ggml_nelements(state) == gr->ne[0] && gr->ne[0] == src_v->ne[0] * src_v->ne[0] * src_v->ne[1];
+}
+
+bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    const ggml_tensor * cache_root = gdn_gather_candidate(gr);
+    if (cache_root == nullptr) {
+        return false;
+    }
+    const auto root_of = gdn_gather_root_of;
 
     const ggml_tensor * gdn = nullptr;
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
@@ -387,14 +407,94 @@ bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_
             return false;
         }
     }
-    if (gdn == nullptr || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    return gdn_gather_gdn_ok(gr, gdn);
+}
+
+void ggml_cuda_gdn_gather_index_build(const ggml_cgraph * cgraph, ggml_cuda_gdn_gather_index & idx) {
+    idx.gathers.clear();
+    idx.writers.clear();
+    idx.built = true;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * cache_root = gdn_gather_candidate(cgraph->nodes[j]);
+        if (cache_root != nullptr) {
+            idx.gathers.emplace(cgraph->nodes[j], ggml_cuda_gdn_gather_index::gather_info{});
+            idx.writers.emplace(cache_root, std::vector<int>{});
+        }
+    }
+    if (idx.gathers.empty()) {
+        return;
+    }
+
+    const auto root_of = gdn_gather_root_of;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n)) {
+            continue;
+        }
+        const bool view_or_noop = ggml_cuda_is_view_or_noop(n);
+        const ggml_tensor * gdn_root =
+            n->op == GGML_OP_GATED_DELTA_NET && n->src[5] != nullptr ? root_of(n->src[5]) : nullptr;
+
+        // a non-view node reading a gather is a reader that blocks the deferral, unless it is that gather's GDN
+        if (!view_or_noop) {
+            const ggml_tensor * read[GGML_MAX_SRC + 1];
+            int n_read = 0;
+            if (n->view_src != nullptr) {
+                read[n_read++] = root_of(n);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (n->src[s] != nullptr) {
+                    read[n_read++] = root_of(n->src[s]);
+                }
+            }
+            for (int k = 0; k < n_read; ++k) {
+                if (read[k] == gdn_root) {
+                    continue;
+                }
+                auto it = idx.gathers.find(read[k]);
+                if (it != idx.gathers.end()) {
+                    it->second.other_reader = true;
+                }
+            }
+        }
+        if (gdn_root != nullptr) {
+            auto it = idx.gathers.find(gdn_root);
+            if (it != idx.gathers.end()) {
+                it->second.gdn = j;
+                it->second.n_gdn++;
+            }
+        }
+
+        if (!view_or_noop) {
+            auto it = idx.writers.find(root_of(n));
+            if (it != idx.writers.end()) {
+                it->second.push_back(j);
+            }
+        }
+    }
+}
+
+// same answer as the per-gather walk above, read from the index
+bool ggml_cuda_gdn_state_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx) {
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    const auto g = idx.gathers.find(gr);
+    if (g == idx.gathers.end() || g->second.n_gdn != 1 || g->second.other_reader) {
+        return false;
+    }
+    const int gdn_idx = g->second.gdn;
+    if (gdn_idx < node_idx) {
         return false;
     }
 
-    const ggml_tensor * src_v = gdn->src[2];
-    const ggml_tensor * state = gdn->src[5];
-    return src_v->ne[2] <= 16 && src_v->ne[3] == 1 && state->data == gr->data &&
-           ggml_nelements(state) == gr->ne[0] && gr->ne[0] == src_v->ne[0] * src_v->ne[0] * src_v->ne[1];
+    // nothing may write the cache between the gather and the GDN
+    const auto w = idx.writers.find(gdn_gather_root_of(gr->src[0]));
+    if (w != idx.writers.end()) {
+        const auto first_after = std::upper_bound(w->second.begin(), w->second.end(), node_idx);
+        if (first_after != w->second.end() && *first_after < gdn_idx) {
+            return false;
+        }
+    }
+    return gdn_gather_gdn_ok(gr, cgraph->nodes[gdn_idx]);
 }
 
 static bool ggml_cuda_topk_moe_fusion_disabled() {
