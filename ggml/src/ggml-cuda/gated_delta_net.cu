@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "gated_delta_net_chunked.cuh"
+#include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
 constexpr int gdn_cols_per_warp = 4;
@@ -250,6 +251,44 @@ static void launch_gated_delta_net(
     }
 }
 
+static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tensor * dst) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * g     = dst->src[3];
+    const ggml_tensor * beta  = dst->src[4];
+    const ggml_tensor * state = dst->src[5];
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H   = v->ne[1];
+    return {
+        (const float *) q->data,
+        (const float *) k->data,
+        (const float *) v->data,
+        (const float *) g->data,
+        (const float *) beta->data,
+        (const float *) state->data,
+        (float *) dst->data,
+        nullptr,
+        H,
+        q->ne[1],
+        v->ne[2],
+        v->ne[3],
+        v->ne[3] / q->ne[3],
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        (int64_t) (q->nb[3] / sizeof(float)),
+        (int64_t) (v->nb[1] / sizeof(float)),
+        (int64_t) (v->nb[2] / sizeof(float)),
+        (int64_t) (v->nb[3] / sizeof(float)),
+        (int64_t) (beta->nb[1] / sizeof(float)),
+        (int64_t) (beta->nb[2] / sizeof(float)),
+        (int64_t) (beta->nb[3] / sizeof(float)),
+        1.0f / sqrtf((float) S_v),
+        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+    };
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
         const ggml_tensor * beta_presig = nullptr) {
@@ -398,6 +437,24 @@ static void ggml_cuda_op_gated_delta_net_impl(
             // opt-out and the non-RDNA fallback.  n_tokens_limit > 0 truncates to a single-seq
             // prefix.
             auto launch_chunked = [&](float * state_d_ext, int64_t n_tokens_limit) -> bool {
+                // GGML_CUDA_GDN_MMA=1: upstream #29353 MMA chunked kernel (bf16 hi/lo split, fp32 state)
+                // ahead of the arch-specific chunked kernels.  Same call contract: it writes the outputs
+                // and slot 0 only, so it runs exactly where the chunked path already runs (above the
+                // rollback bound).  Unsupported shapes/devices return false and fall through.
+                static const bool use_gdn_mma = getenv("GGML_CUDA_GDN_MMA") != nullptr && atoi(getenv("GGML_CUDA_GDN_MMA")) != 0;
+                if (use_gdn_mma && n_tokens_limit == 0) {
+                    ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
+                    args.state_out = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;
+                    if (ggml_cuda_gdn_mma_launch(ggml_cuda_get_device(), args, stream)) {
+                        static bool logged_mma = false;
+                        if (!logged_mma) {
+                            GGML_LOG_INFO("%s: GDN MMA chunked prefill n=%ld K=%d n_seqs=%ld H=%ld\n",
+                                          __func__, (long) n_tokens, K, (long) n_seqs, (long) H);
+                            logged_mma = true;
+                        }
+                        return true;
+                    }
+                }
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
                 const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);

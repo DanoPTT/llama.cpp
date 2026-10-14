@@ -2,7 +2,14 @@
 #include "mma.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <mutex>
+
+// RDNA4 (gfx12) uses the same bf16 WMMA schedule as RDNA3; only the A/B operand layout differs
+// (I_MAJOR instead of RDNA3's I_MAJOR_MIRRORED, see get_input_data_layout()).
+#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && (defined(RDNA3) || defined(RDNA4)))
+#define GDN_MMA_AVAILABLE
+#endif
 
 namespace {
 constexpr int D = 128;
@@ -56,11 +63,11 @@ template <int C, int V> struct alignas(128) shared {
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
 
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#if defined(GDN_MMA_AVAILABLE)
 using namespace ggml_cuda_mma;
 #ifdef GGML_USE_HIP
 using acc    = tile<16, 16, float, DATA_LAYOUT_J_MAJOR>;
-using a_tile = tile<16, 8, nv_bfloat162, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+using a_tile = tile<16, 8, nv_bfloat162, get_input_data_layout()>;
 using b_tile = a_tile;
 #else
 using acc    = tile<16, 8, float>;
@@ -118,13 +125,13 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
     }
 #endif // GGML_USE_HIP
 }
-#endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#endif // defined(GDN_MMA_AVAILABLE)
 
 // Each block owns V independent value columns and advances by C tokens.
 // Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
 template <int C, int V, int BLOCKS = 1>
 static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
-#if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#if defined(GDN_MMA_AVAILABLE)
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
     constexpr int WARPS = 8;
 #ifdef GGML_USE_HIP
@@ -360,7 +367,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #else
     GGML_UNUSED_VARS(a);
     NO_DEVICE_CODE;
-#endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
+#endif // defined(GDN_MMA_AVAILABLE)
 }
 
 template <int C, int V, int BLOCKS = 1> bool init(int device) {
@@ -391,6 +398,19 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
     }
     const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
+    if (GGML_CUDA_CC_IS_RDNA4(info.cc)) {
+        // GGML_CUDA_GDN_MMA_V: value-slice width (64 = default, 32 = twice the CTAs, half the LDS).
+        // GGML_CUDA_GDN_MMA_MIN_TOKENS: shortest per-seq batch that takes the MMA path.
+        static const int     v_env   = getenv("GGML_CUDA_GDN_MMA_V") ? atoi(getenv("GGML_CUDA_GDN_MMA_V")) : 64;
+        static const int64_t min_tok = getenv("GGML_CUDA_GDN_MMA_MIN_TOKENS") ? atoll(getenv("GGML_CUDA_GDN_MMA_MIN_TOKENS")) : 64;
+        if (a.n_tokens < min_tok) {
+            return gdn_path::ar;
+        }
+        if (v_env == 32) {
+            return init<16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
+        }
+        return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+    }
     if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
         return gdn_path::ar;
     }
@@ -427,7 +447,11 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
         return false;
     }
 #ifdef GGML_USE_HIP
-    gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    if (path == gdn_path::slice32_one_block) {
+        gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    } else {
+        gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    }
 #else
     if (path == gdn_path::slice32_two_blocks) {
         gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
