@@ -784,9 +784,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
 
         const int vil = (vl >> (4*(i&1))) & 0x0F0F0F0F;
 
+#if defined(GGML_USE_HIP)
+        // vi = (vil | 16*h) - 32 per byte, h = the 2 high bits.  16*h - 32 is one of 0xE0, 0xF0, 0x00, 0x10 (zero low
+        // nibble), so one byte-table lookup and an OR replace the shift/mask and the emulated byte subtract.
+        const int vi = vil | __builtin_amdgcn_perm(0, 0x1000F0E0, (vh >> (4*(i&1))) & 0x03030303);
+#else
         const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
 
         const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+#endif // defined(GGML_USE_HIP)
 
         sumf += d8[i&1] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
     }
