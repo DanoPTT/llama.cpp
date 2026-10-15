@@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -32,8 +33,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     size = mem_size;
     used = 0;
 
-    this->n_rs_seq = n_rs_seq;
+    this->n_rs_seq   = n_rs_seq;
+    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
     rs_idx.assign(n_seq_max, 0);
+    last_ubatch_nseq_tokens_by_seq.assign(n_seq_max, 0);
+    last_ubatch_pos_last_by_seq.assign(n_seq_max, -1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -127,7 +131,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     if (is_empty()) {
         if (n_rs_seq > 0) {
-            n_rs_seq = 0;
+            this->n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
     }
@@ -138,7 +142,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_p = size_p_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, this->n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
@@ -184,6 +188,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        // issue #131: a fully removed sequence's last-batch shape is no longer meaningful
+        if (seq_id < 0) {
+            std::fill(last_ubatch_nseq_tokens_by_seq.begin(), last_ubatch_nseq_tokens_by_seq.end(), 0);
+            std::fill(last_ubatch_pos_last_by_seq.begin(), last_ubatch_pos_last_by_seq.end(), -1);
+        } else if ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size()) {
+            last_ubatch_nseq_tokens_by_seq[seq_id] = 0;
+            last_ubatch_pos_last_by_seq[seq_id]    = -1;
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -211,7 +223,31 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // The sequence's own last batch (issue #131), not the global last batch.
+                const uint32_t  last_seq_nseq = ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size())
+                        ? last_ubatch_nseq_tokens_by_seq[seq_id] : 0;
+                const llama_pos last_seq_pos  = ((size_t) seq_id < last_ubatch_pos_last_by_seq.size())
+                        ? last_ubatch_pos_last_by_seq[seq_id] : -1;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    // Guard: the snapshot path assumes a rollback only removes tokens the last
+                    // batch decoded, i.e. that only batches at or below n_rs_batch -- speculative
+                    // verify batches -- are rolled back into.  A larger batch is not a verify
+                    // batch, and the whole-batch chunked GDN prefill (gated_delta_net.cu,
+                    // GDN_CHUNKED_MIN_TOKENS) writes only the newest snapshot for it, so restoring
+                    // snapshot `rollback` would read an unwritten slot.  Warn once rather than
+                    // corrupt silently.
+                    if (!warned_rollback_boundary && last_seq_nseq > n_rs_batch) {
+                        warned_rollback_boundary = true;
+                        LLAMA_LOG_WARN("%s: rollback crossed a batch boundary: seq %d rollback=%d but "
+                                "the sequence's last batch decoded %u tokens (last pos %d, n_rs_seq=%u, n_rs_batch=%u). The "
+                                "recurrent snapshot path assumes only verify batches (<= n_rs_batch "
+                                "tokens) are rolled back into; if that batch exceeded the chunked-GDN "
+                                "threshold it wrote no usable snapshot and the restored state is "
+                                "wrong -- set GGML_CUDA_GDN_CHUNKED=0 for the sequential kernel. "
+                                "Please report this at github.com/stew675/llama-cpp-rdna-boosts/issues\n",
+                                __func__, (int) seq_id, (int) rollback, last_seq_nseq,
+                                (int) last_seq_pos, n_rs_seq, n_rs_batch);
+                    }
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -515,10 +551,46 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
 
+    // remember the shape of the batch that is about to run, for the rollback guard in seq_rm()
+    if (!ubatches.empty()) {
+        const llama_ubatch & ub = ubatches.back();
+        last_ubatch_nseq_tokens = ub.n_seq_tokens;
+        last_ubatch_pos_last    = ub.n_tokens > 0 ? ub.pos[ub.n_tokens - 1] : -1;
+        // issue #131: per-sequence last-batch shape.  Only the sequences present in this ubatch are
+        // updated; the others keep the count from the last batch they ran in.
+        for (uint32_t s = 0; s < ub.n_seqs_unq; ++s) {
+            const llama_seq_id sid = ub.seq_id_unq[s];
+            if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
+                last_ubatch_nseq_tokens_by_seq[sid] = 0;
+                last_ubatch_pos_last_by_seq[sid]    = -1;
+            }
+        }
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const llama_seq_id sid = ub.seq_id[i][0];
+            if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
+                last_ubatch_nseq_tokens_by_seq[sid]++;
+                if (ub.pos != nullptr) {
+                    last_ubatch_pos_last_by_seq[sid] = ub.pos[i * ub.n_pos];
+                }
+            }
+        }
+    }
+
     return success;
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    // A qwen4exp MTP context carries a hybrid-idx memory whose recurrent filter matches nothing
+    // (the nextn layer is not recurrent), so its cells are never read back - the graph only gives
+    // the unused recurrent inputs a trivial use, and llama_memory_hybrid_idx skips the recurrent
+    // in seq_rm/state.  The bookkeeping below still runs (the graph input sizes need `n`), but the
+    // speculative verify positions must not spam the non-consecutive-position warning.
+    const bool has_recr = [&] {
+        for (ggml_tensor * t : r_l) { if (t) { return true; } }
+        for (ggml_tensor * t : s_l) { if (t) { return true; } }
+        return false;
+    }();
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -672,7 +744,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (has_recr && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
@@ -741,12 +813,12 @@ bool llama_memory_recurrent::is_empty() const {
 }
 
 size_t llama_memory_recurrent::total_size() const {
-    size_t size = 0;
+    size_t size_l = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+        size_l += ggml_backend_buffer_get_size(buf.get());
     }
 
-    return size;
+    return size_l;
 }
 
 size_t llama_memory_recurrent::size_r_bytes() const {
@@ -908,8 +980,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
             io.write(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id) {
-                for (auto seq_id : cell.seq_id) {
-                    io.write(&seq_id, sizeof(seq_id));
+                for (auto seq_id_i : cell.seq_id) {
+                    io.write(&seq_id_i, sizeof(seq_id_i));
                 }
             }
         }

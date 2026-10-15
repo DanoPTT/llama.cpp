@@ -368,6 +368,11 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // WIP r42: MoE expert-cache arena counters at the end of the previous turn, for the per-turn decode
+    // hit-rate line (the counters are process-global; `mutable` because print_timings() is const)
+    mutable int64_t moe_hits_prev   = 0;
+    mutable int64_t moe_misses_prev = 0;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -723,6 +728,25 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // WIP r42: the MoE expert-cache arena's decode hit rate for this turn (logged at the same level
+        // as the MTP acceptance line above).  The arena is active only with host-resident MoE experts.
+        {
+            int64_t moe_hits = 0, moe_misses = 0, moe_arena = 0;
+            if (ctx_tgt != nullptr &&
+                    llama_moe_cache_stats(llama_get_model(ctx_tgt), &moe_hits, &moe_misses, &moe_arena)) {
+                const int64_t d_hits   = moe_hits   - moe_hits_prev;
+                const int64_t d_misses = moe_misses - moe_misses_prev;
+                const int64_t d_total  = d_hits + d_misses;
+                if (d_total > 0) {
+                    SLT_INF(*this, "  MoE arena = %0.4f (%5lld hit / %5lld reaches this turn), arena %.1f MiB\n",
+                            (double) d_hits / (double) d_total, (long long) d_hits, (long long) d_total,
+                            (double) moe_arena / (1024.0 * 1024.0));
+                }
+                moe_hits_prev   = moe_hits;
+                moe_misses_prev = moe_misses;
+            }
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1122,9 +1146,7 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_mtp = params_base.speculative.has_mtp();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -3511,6 +3533,10 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        if (spec) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -4455,7 +4481,12 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // partial acceptance is not supported by the context -> truncate the draft and restore the state.
+                        // the accepted prefix is not committed here: it is replayed and re-verified next round, whose
+                        // accept() would carry the stale draft count of this round. report the partial acceptance now
+                        // via accept_partial - only the adaptive MTP controller consumes it
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
+
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
