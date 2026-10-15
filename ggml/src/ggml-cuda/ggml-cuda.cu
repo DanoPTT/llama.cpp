@@ -995,7 +995,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 }
 
 
-// GGML_CUDA_ASYNC_INPUT=1: graph inputs (small host -> device writes into a compute buffer) are staged through a
+// GGML_CUDA_ASYNC_INPUT (default on, =0 off): graph inputs (small host -> device writes into a compute buffer) are staged through a
 // per-device pinned ring and copied asynchronously on cudaStreamPerThread (the stream the synchronous path uses, so a
 // later get_tensor stays ordered after it); an event is recorded per copy and the next graph on that device makes its
 // compute stream wait for it (ggml_cuda_async_input_wait).  The host no longer waits for each input copy.  The ring
@@ -1014,7 +1014,8 @@ struct ggml_cuda_async_input_dev {
 static ggml_cuda_async_input_dev g_async_input[GGML_CUDA_MAX_DEVICES];
 static const bool g_async_input_on = [] {
     const char * e = getenv("GGML_CUDA_ASYNC_INPUT");
-    return e != nullptr && atoi(e) != 0;
+    // f711: default on (r56 on gfx1201: +1.4 % tg128 Q6_K, server outputs bit-identical); =0 restores the sync copy
+    return e == nullptr || atoi(e) != 0;
 }();
 static constexpr size_t GGML_CUDA_ASYNC_INPUT_MAX  = 1u << 20;
 static constexpr size_t GGML_CUDA_ASYNC_INPUT_RING = 16u << 20;
