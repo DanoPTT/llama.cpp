@@ -548,10 +548,10 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 #define VDR_Q4_K_Q8_1_MMVQ_MOE 4
 #define VDR_Q4_K_Q8_1_MMQ  8
 
-// contiguous v/x values
+// contiguous v/x values; scm packs the two scales (bytes 0, 1) and the two mins (bytes 2, 3)
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
-    const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
+    const int * __restrict__ v, const int * __restrict__ u, const uint32_t scm,
+    const half2 & dm4, const float * __restrict__ d8) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -564,8 +564,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
-        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, sc[i]);
-        sumf_m += d8[i] * ggml_cuda_mul_small(dot2, m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, (scm >> (8*i)) & 0xFF);
+        // multiply constant part of q4_K with sum of q8_1 values.  Same value as d8[i] * float(dot2 * m): d8[i] (11
+        // significant bits) times |dot2| <= 1024 is exact in fp32, so the fma sees the same exact product and rounds
+        // once.  The first factor depends only on the q8_1 column and the second only on the weight row, so a
+        // multi-row, multi-column block computes each once instead of per (row, column).
+        sumf_m += (d8[i] * (float) dot2) * (float) ((scm >> (8*i + 16)) & 0xFF);
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -1106,22 +1110,20 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    // branchless so nvcc can hoist this out of the ncols_dst loop
+    // branchless so nvcc can hoist this out of the ncols_dst loop.  The two scales (bytes 0, 1) and mins (bytes 2, 3)
+    // of sub-block pair j in one word: j < 2 takes the low 6 bits of scales[j], scales[j+2]; j >= 2 the low/high
+    // nibbles of scales[j+2] plus the top 2 bits of scales[j-2], scales[j].  Both are built 32 bits at a time and the
+    // lane's j (constant over the K loop) picks one.
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     const int j  = bq8_offset/2;
     const int jm = j & 1;
 
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
+    const uint32_t s02 = scales[jm + 0] | ((uint32_t) scales[jm + 2] << 16);
+    const uint32_t s4  = scales[jm + 4];
 
-    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
-
-    uint16_t aux[2];
-    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
-    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-    const uint8_t * sc = (const uint8_t *)aux;
-    const uint8_t * m  = sc + 2;
+    const uint32_t scm_lo = s02 & 0x3f3f3f3f;
+    const uint32_t scm_hi = ((s4 | (s4 << 12)) & 0x0f0f0f0f) | ((s02 & 0xc0c0c0c0) >> 2);
+    const uint32_t scm    = j >= 2 ? scm_hi : scm_lo;
 
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
@@ -1132,7 +1134,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, scm, bq4_K->dm, d8);
 }
 
 // VDR=4 entry point: iqs must be a multiple of 4 (the mmvq kernel strides kqs
