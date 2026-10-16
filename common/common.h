@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -172,18 +173,19 @@ enum common_params_sampling_config : uint64_t {
 };
 
 enum common_speculative_type {
-    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+    COMMON_SPECULATIVE_TYPE_NONE,                   // no speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,            // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,            // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,               // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,      // MTP with adaptive draft depth
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,            // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,            // DSpark speculative decoding (DFlash + Markov head)
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,            // simple self-speculative decoding based on n-grams
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,             // self-speculative decoding with n-gram keys only
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,           // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,             // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_COUNT                    // number of types, unknown type
 };
 
 // Grammar type enumeration
@@ -328,6 +330,8 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (the default cold start is three steps below --spec-draft-n-max, bounded by this floor)
+    int32_t n_start        = 0; // explicit initial adaptive MTP draft depth; 0 = the default (clamped to [n_min_adaptive, n_max])
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -342,6 +346,9 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+
+    // `--spec-draft-n-cpu-moe N`: see `common_params::n_cpu_moe`
+    int n_cpu_moe = 0;
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -392,13 +399,21 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool has_mtp() const {
+        return std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+        });
+    }
+
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        bool needs_rs_seq = has_mtp() || std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -490,6 +505,14 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    // how host-resident expert weights (`-ncmoe`/`-cmoe`) are backed when the model is mmap'd
+    enum llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
+
+    // `-ncmoe N` count, kept so `common_model_params_to_llama` can set
+    // `llama_model_params.n_cpu_moe_from_end` and the loader can host the LAST N trunk layers
+    // (`LLAMA_HOST_EXPERTS_FROM_END=0` restores the historical first-N placement).
+    int n_cpu_moe = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -576,6 +599,16 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+
+    // release the wide-prefill compute layout at the prefill->decode transition so the MoE expert-cache
+    // arena can be sized large.  ON by default everywhere: under the movable-boundary slab a later wide
+    // prefill reclaims the wide layout by MOVING THE SLAB BOUNDARY (evicting only the arena tables that
+    // live in the chunks the work pool takes), so the drop no longer makes a server unsafe -- verified
+    // with wide1 -> short -> wide2 at -ub 8192: 0 aborts, coherent, arena restored to 35254.8 MiB.  Before
+    // the slab this was cli-only, because the server could not reclaim the wide layout (the whole arena
+    // freed still did not yield one contiguous ~12.4-12.9 GiB block).  LLAMA_DROP_COMPUTE_BUFFERS=0 is the
+    // kill switch; it is only needed where the compute layout CANNOT be reclaimed (a non-slab backend).
+    bool drop_compute_buffers = true;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -1250,6 +1283,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
     // keep strings alive and avoid leaking memory by storing them in a static list
     static std::list<std::string> buft_override_strings;
+    // The forward `blk.0..n-1` patterns.  When `llama_model_params.n_cpu_moe_from_end` is set (the
+    // default for `-ncmoe`), the model loader ignores these and hosts the LAST n trunk layers instead.
     for (int i = 0; i < n; ++i) {
         buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
         overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
