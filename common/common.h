@@ -629,6 +629,11 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
 
+    // block 07 (r290): the verify band's WMMA iu8 floor in columns -- the first verify width that takes the
+    // tensor-core family instead of the K-split mmvq kernel (0 = off, the default).  `--wmma-verify auto` resolves to 7, the first width at which it beats the K-split
+    // kernel; below it the family is SLOWER (see ENVIRONMENT.md and GREEDY-PURITY.md).
+    int32_t wmma_verify = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
