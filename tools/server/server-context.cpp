@@ -408,6 +408,11 @@ struct server_slot {
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
 
+    // WIP r42: MoE expert-cache arena counters at the end of the previous turn, for the per-turn decode
+    // hit-rate line (the counters are process-global; `mutable` because print_timings() is const)
+    mutable int64_t moe_hits_prev   = 0;
+    mutable int64_t moe_misses_prev = 0;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -792,6 +797,25 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // WIP r42: the MoE expert-cache arena's decode hit rate for this turn (logged at the same level
+        // as the MTP acceptance line above).  The arena is active only with host-resident MoE experts.
+        {
+            int64_t moe_hits = 0, moe_misses = 0, moe_arena = 0;
+            if (ctx_tgt != nullptr &&
+                    llama_moe_cache_stats(llama_get_model(ctx_tgt), &moe_hits, &moe_misses, &moe_arena)) {
+                const int64_t d_hits   = moe_hits   - moe_hits_prev;
+                const int64_t d_misses = moe_misses - moe_misses_prev;
+                const int64_t d_total  = d_hits + d_misses;
+                if (d_total > 0) {
+                    SLT_INF(*this, "  MoE arena = %0.4f (%5lld hit / %5lld reaches this turn), arena %.1f MiB\n",
+                            (double) d_hits / (double) d_total, (long long) d_hits, (long long) d_total,
+                            (double) moe_arena / (1024.0 * 1024.0));
+                }
+                moe_hits_prev   = moe_hits;
+                moe_misses_prev = moe_misses;
+            }
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1096,6 +1120,27 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
+    // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
+    // take turns on their own slots do not copy their whole state to host memory and back on every switch
+    const bool lazy_idle_slots = [] {
+        const char * e = getenv("LLAMA_SERVER_LAZY_IDLE_SLOTS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    // LLAMA_SERVER_PARK_IDLE_SLOTS (on unless 0, with the lazy idle slots above): when a task starts, the resident idle
+    // slots are parked at the top of the KV cache (llama_memory_seq_park, a device copy) and the slots that run are moved
+    // to the low cells.  A sequence that runs alone then sits in the same cells and attends over the same range as when
+    // the idle slots are saved and cleared, so its output no longer depends on which other conversations stay resident.
+    // An idle slot that cannot be parked is saved to the prompt cache and cleared, as without lazy idle slots.  A KV cache
+    // that does not support parking at all (a sliding window, cells shared with a draft model, no flash attention) keeps the
+    // lazy idle slots as they are (park_supported).
+    const bool park_idle_slots = [] {
+        const char * e = getenv("LLAMA_SERVER_PARK_IDLE_SLOTS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    int park_supported = -1; // -1: not asked yet
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1198,10 +1243,8 @@ private:
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
+        const bool spec_mtp = params_base.speculative.has_mtp();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1287,7 +1330,7 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        llama_init = common_init_from_params(params_base, /*model_only =*/ false, /*preload_draft =*/ true);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1327,7 +1370,7 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt, llama_init->take_draft_model());
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
 
@@ -1864,9 +1907,21 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // the entry this task will restore is held out of the cache while the slot is saved, so the eviction
+                // that the save may cause cannot drop it
+                std::list<server_prompt_cache_state> held;
+                if (lazy_idle_slots) {
+                    auto it = prompt_cache->find(ret->prompt, task.tokens);
+                    if (it != prompt_cache->states.end()) {
+                        held.splice(held.begin(), prompt_cache->states, it);
+                    }
+                }
+
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                prompt_cache->states.splice(prompt_cache->states.end(), held);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens) && !prompt_load_with_room(*ret, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -1879,16 +1934,103 @@ private:
         return ret;
     }
 
+    // a restore can fail for want of KV cells that another idle slot holds (unified KV cache): move idle slots to the prompt
+    // cache one at a time, with the entry being restored kept out of the eviction that their saving may cause, and retry
+    bool prompt_load_with_room(server_slot & slot, const server_tokens & tokens) {
+        if (!lazy_idle_slots || !params_base.kv_unified) {
+            return false;
+        }
+        while (true) {
+            auto it = prompt_cache->find(slot.prompt, tokens);
+            if (it == prompt_cache->states.end()) {
+                return false;
+            }
+            std::list<server_prompt_cache_state> held;
+            held.splice(held.begin(), prompt_cache->states, it);
+            const bool cleared = try_clear_idle_slots(&slot);
+            prompt_cache->states.splice(prompt_cache->states.end(), held);
+            if (!cleared) {
+                return false;
+            }
+            SLT_INF(slot, "%s", "retrying the prompt cache restore\n");
+            if (slot.prompt_load(*prompt_cache, tokens)) {
+                return true;
+            }
+        }
+    }
+
+    // park_idle_slots: the idle slots go up first, so the low cells are free, then the slots that run come down
+    void park_idle_slots_for_launch() {
+        if (park_supported < 0) {
+            park_supported = !slots.empty() && slots[0].mem.can_park() ? 1 : 0;
+            SRV_INF("idle slot parking: %s\n", park_supported ? "on" : "not supported by this KV cache, the idle slots stay where they are");
+        }
+        if (!park_supported) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (!slot.mem.seq_park(slot.id, true)) {
+                // with --no-cache-idle-slots the lazy idle slots are left resident (there is no saved copy to
+                // restore), so a slot that cannot be parked must stay resident too -- clearing it here would
+                // throw its KV away and change the behaviour the flag was chosen for
+                if (!params_base.cache_idle_slots) {
+                    SLT_DBG(slot, "%s", "cannot park the idle slot: leaving it resident (--no-cache-idle-slots)\n");
+                    continue;
+                }
+                SLT_INF(slot, "%s", "cannot park the idle slot: saving it to the prompt cache and clearing it\n");
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
+                slot.prompt_clear();
+            }
+        }
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            // no room below the parked slots: those go to the prompt cache, least recently used first
+            while (!slot.mem.seq_park(slot.id, false)) {
+                if (!try_clear_idle_slots(&slot)) {
+                    SLT_WRN(slot, "%s", "cannot move the parked context back down (the KV cache gives parking up)\n");
+                    break;
+                }
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(const server_slot * keep = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        if (lazy_idle_slots) {
+            // the least recently used idle slot goes first, and it goes to the prompt cache, so it can be resumed
+            server_slot * lru = nullptr;
+            for (auto & slot : slots) {
+                if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
+                        (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                    lru = &slot;
+                }
+            }
+            if (lru == nullptr) {
+                return res;
+            }
+            SRV_WRN("making room in the KV cache: saving and clearing idle slot %d with %zu tokens\n", lru->id, lru->prompt.tokens.size());
+            if (prompt_cache && params_base.cache_idle_slots && lru->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+            lru->prompt_clear();
+            return true;
         }
 
         for (auto & slot : slots) {
@@ -3009,7 +3151,11 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (lazy_idle_slots && park_idle_slots && params_base.kv_unified) {
+                        park_idle_slots_for_launch();
+                    }
+
+                    if (params_base.cache_idle_slots && !lazy_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -3907,6 +4053,10 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        if (spec) {
+                            common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4859,7 +5009,12 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // partial acceptance is not supported by the context -> truncate the draft and restore the state.
+                        // the accepted prefix is not committed here: it is replayed and re-verified next round, whose
+                        // accept() would carry the stale draft count of this round. report the partial acceptance now
+                        // via accept_partial - only the adaptive MTP controller consumes it
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
+
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 

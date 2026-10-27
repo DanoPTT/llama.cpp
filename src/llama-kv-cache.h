@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -114,7 +115,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
+        // no V tensor is allocated, and no V-side op may be issued against the cache
+                         bool   v_enabled = true);
 
     ~llama_kv_cache() = default;
 
@@ -138,6 +142,19 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
+
+    // parking (unified cache only): the cells of an idle sequence move to the top of the cache, stacked below the
+    // sequences parked before it, and new cells are only taken below the lowest parked cell.  get_n_kv() stops below it
+    // too, so a sequence in the low cells attends over the same range, at the same cell indices, as in a cache that
+    // holds nothing else -- its results do not depend on what is parked.  seq_unpark() moves a parked sequence back
+    // to the lowest free run.  Both return false, changing nothing, when the move is not possible (not unified, the
+    // cells are shared or not contiguous, no room).  The K/V data are copied on the device.
+    bool seq_park  (llama_seq_id seq_id);
+    bool seq_unpark(llama_seq_id seq_id);
+    bool seq_parked(llama_seq_id seq_id) const;
+
+    // whether this cache supports parking at all: one stream, cells it does not share, V not transposed, no sliding window
+    bool can_park() const;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
@@ -190,7 +207,7 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -236,6 +253,14 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // V3 derived kq mask: true when the packed mask for this batch can be replaced by the compact
+    // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
+    // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -273,6 +298,9 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // env: LLAMA_KV_N_PAD_PREFILL (0 when inactive)
+    const uint32_t n_pad_prefill = 0;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -316,6 +344,22 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // parked sequences (stream 0 of a unified cache): [first cell, last cell + 1), see seq_park()
+    std::map<llama_seq_id, std::pair<uint32_t, uint32_t>> parked;
+
+    // the lowest parked cell, or the cache size
+    uint32_t park_bound() const;
+
+    // drops parked entries whose sequence is gone and narrows the others to the cells they still hold
+    void park_refresh();
+
+    // moves cells [src, src + n) to [dst, dst + n) on stream 0, K/V data and cell state, overlap-safe
+    void park_move(uint32_t src, uint32_t dst, uint32_t n);
+
+    // moves the parked sequences up so that they sit together at the top of the cache, in their order: a sequence that
+    // leaves the stack would otherwise leave a hole that the next one to come down cannot use
+    void park_compact();
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -431,6 +475,12 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // V3 derived kq mask - see llama_kv_cache::kq_mask_derivable
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

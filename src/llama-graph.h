@@ -47,6 +47,7 @@ enum llm_graph_type {
 
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
+    LLM_FUSED_OP_FLASH_ATTN_DERIVED, // V3: flash attention fed by the derived kq mask (no packed mask)
     LLM_FUSED_OP_GDN_AR,
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -100,6 +101,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_mtp_draft_vocab;
 
 //
 // llm_graph_input
@@ -108,8 +110,12 @@ struct llm_graph_params;
 class llm_graph_input_i {
 public:
     llm_graph_input_i() {
-        const char * LLAMA_GRAPH_INPUT_DEBUG = getenv("LLAMA_GRAPH_INPUT_DEBUG");
-        debug = LLAMA_GRAPH_INPUT_DEBUG ? atoi(LLAMA_GRAPH_INPUT_DEBUG) : 0;
+        // read once: a graph input object is constructed on every decode; getenv() is expensive on Windows
+        static const int input_debug = [] {
+            const char * env = getenv("LLAMA_GRAPH_INPUT_DEBUG");
+            return env != nullptr ? atoi(env) : 0;
+        }();
+        debug = input_debug;
     }
 
     virtual ~llm_graph_input_i() = default;
@@ -406,6 +412,39 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    const llama_kv_cache_context * mctx;
+};
+
+// V3 derived kq mask: the compact per-cell state that can replace the packed
+// [n_kv, n_tps, 1, n_stream] kq mask.  flash attention derives each cell's visibility from
+// cell_pos[j] vs [tok_lo[i], tok_hi[i]] instead of loading the mask from memory.
+//
+// the packed mask tensor is still created by the graph builder (so every consumer keeps working
+// unchanged) - it simply ends up without consumers when the derived form is used, and the gallocr
+// then leaves it unallocated (no VRAM, no host copy, no per-ubatch fill).
+class llm_graph_input_kq_derived : public llm_graph_input_i {
+public:
+    llm_graph_input_kq_derived(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_kq_derived() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * cell_pos = nullptr; // I32 [n_kv, n_stream]
+    ggml_tensor * tok_lo   = nullptr; // I32 [n_tps, n_stream]
+    ggml_tensor * tok_hi   = nullptr; // I32 [n_tps, n_stream]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -813,6 +852,8 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -874,6 +915,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // Llama-Frankenstein F1: a device-feature injection graph is not a drafting graph
+        if (cparams.lf_dev_inject != other.cparams.lf_dev_inject) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -902,6 +948,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.mtp_draft_vocab         == other.cparams.mtp_draft_vocab         &&
+            mtp_draft == other.mtp_draft &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1018,6 +1066,13 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// V3: the compact inputs that replace a packed kq mask in the flash attention op
+struct llm_graph_kq_derived {
+    ggml_tensor * cell_pos = nullptr;
+    ggml_tensor * tok_lo   = nullptr;
+    ggml_tensor * tok_hi   = nullptr;
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1071,9 +1126,17 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // V3 derived kq mask: the masks that may be replaced by their derived form, keyed by the mask
+    // tensor. build_attn_mha() consumes the entry (if any) when it builds the flash attention node,
+    // so any other consumer of the mask keeps working and simply forces the packed mask to be
+    // materialized by the allocator (it has a consumer, hence it is allocated and filled).
+    mutable std::map<const ggml_tensor *, llm_graph_kq_derived> kq_derived;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1284,6 +1347,19 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    std::unique_ptr<llm_graph_input_attn_kv>  build_attn_inp_kv_impl     (const llama_kv_cache_context *     mctx) const;
+    std::unique_ptr<llm_graph_input_attn_k>   build_attn_inp_k_impl      (const llama_kv_cache_context *     mctx) const;
+    std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(const llama_kv_cache_dsa_context * mctx) const;
+
+    // V3: build the kq mask for the given cache context. when the derived form is possible
+    // (allow_derived and every runtime gate passes) a compact state input is added to the graph and
+    // registered in kq_derived, keyed by the returned mask tensor
+    ggml_tensor * build_attn_inp_kq_mask(
+            const llama_kv_cache_context * mctx,
+            const llama_ubatch & ubatch,
+            const llama_cparams & cparams,
+            bool allow_derived) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
