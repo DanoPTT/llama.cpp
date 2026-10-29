@@ -1,3 +1,56 @@
+> [!NOTE]
+> **This is the DanoPTT fork of llama.cpp for one AMD Radeon AI PRO R9700** (gfx1201, RDNA4, ROCm/HIP, Windows 11).
+> It is not an official llama.cpp build. The upstream README continues below the fork section.
+
+## Fork: production build (as of 2026-10-29)
+
+**Branch `f711-rdna-r160-stack1028` @ `133b70260`** (the default branch of this fork, in production since 2026-10-28):
+
+- upstream llama.cpp `6050b467c`
+- [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) release `v15-6050b467c-r160` (tree `1574b375`), commit `349132e8f`
+- 9 carry commits on top:
+
+| commit | change | upstream |
+|---|---|---|
+| `c7e92b4ae` | server: clear stale state when reusing LRU-selected slots | #27624 |
+| `804a927b0` | server: consult the prompt cache when the outgoing state is not worth saving | port of #28992 |
+| `83001ced0`, `83437b124` | server: emit tool results before user text in Anthropic `/v1/messages` conversion (+ test) | #29482 |
+| `ba6eecdb6` | server: don't store the draft KV in context checkpoints | #29509 |
+| `178b26d85` | cuda: keep the decode-only SSM fusions off by default | #28768 |
+| `a3b1dece0` | server: fall back to full prompt re-processing when memory rollback fails | #28007 |
+| `133b70260` | cuda: `__vsub4` in the non-HIP Q6_K mmvq VDR=2 kernel | follow-up to #29478 |
+| `beeee3ebe` | ci: `f711-rocm` workflow (Windows, ROCm 10.0.0, gfx1201, `workflow_dispatch` only) | – |
+
+Rollback branch: `f711-rdna-r149-stack1027` (stew r149, same carry set).
+
+### Runtime configuration
+
+- Model: Qwen3.8-27B UD-Q5_K_XL (dense hybrid, Gated Delta Net + attention) with built-in MTP head, mmproj F16 on CPU (`--no-mmproj-offload`)
+- `-c 262144 -np 2 --kv-unified -fa on -ub 512 -b 1024 --cache-type-k q8_0 --cache-type-v q8_0`
+- Speculative decoding: `--spec-type draft-mtp --spec-draft-n-max 3`, draft KV `-ctkd q8_0 -ctvd q8_0`
+- `--cache-ram 10240 --ctx-checkpoints 8 --jinja` with a patched Qwen chat template, sampling `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 --presence-penalty 1.5`
+- Environment: `GGML_CUDA_FA_STAGE_PREALLOC=2`, `GGML_CUDA_FA_STAGE_MAX_MB=256` (without them pp at 100k drops ~24 % and WDDM shared memory grows to ~2.9 GB)
+- Client: Claude Code via the Anthropic-compatible `/v1/messages` endpoint
+
+### Measured in production (2026-10-28 17:57 → 2026-10-29 09:30, 15.7 h, 223 requests)
+
+| metric | value |
+|---|---|
+| prefill (prompts > 5k tokens) | 584–1124 t/s, median 970 t/s |
+| decode | median 44.4 t/s; 31–53 t/s at 120k–153k tokens of context |
+| MTP draft acceptance | median 0.685 |
+| VRAM dedicated / WDDM shared | 31.7 GB / 1.26 GB, no growth overnight |
+| host RAM (server process) | private 44.4 GB, working set 24.9 GB |
+| errors / asserts / re-reserves | 0 |
+
+Release gate (2026-10-28) against r149: PPL 1.8683 bit-identical, greedy output hashes identical across draft KV variants, tg/pp within noise, dedicated VRAM −480 MiB. The only failing `test-backend-ops` case is SOLVE_TRI, a known test artifact (ggml-org/llama.cpp#31108).
+
+### Building
+
+Run the `f711-rocm` workflow (Actions → f711-rocm → Run workflow) on the production branch. The defaults are ROCm 10.0.0 and `AMDGPU_TARGETS=gfx1201`.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
