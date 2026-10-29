@@ -1,3 +1,56 @@
+> [!NOTE]
+> **This is the DanoPTT fork of llama.cpp for one AMD Radeon AI PRO R9700** (gfx1201, RDNA4, ROCm/HIP, Windows 11).
+> It is not an official llama.cpp build. The upstream README continues below the fork section.
+
+## Fork: rollback build r149
+
+**Branch `f711-rdna-r149-stack1027` @ `2a09574f5`** was the production build from 2026-10-27 13:22 to 2026-10-28 17:57. It is now kept as the **rollback** for the production branch `f711-rdna-r160-stack1028` (the default branch of this fork; see its README for the current production state).
+
+- upstream llama.cpp `6050b467c`
+- [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) release `v15-6050b467c-r149` (tree `423a59a6`), commit `faf81eb51`
+- 9 carry commits on top (the same set as r160):
+
+| commit | change | upstream |
+|---|---|---|
+| `531c47787` | server: clear stale state when reusing LRU-selected slots | #27624 |
+| `dd69cb41b` | server: consult the prompt cache when the outgoing state is not worth saving | port of #28992 |
+| `4177dbaf4`, `89632a8eb` | server: emit tool results before user text in Anthropic `/v1/messages` conversion (+ test) | #29482 |
+| `0b1827c53` | server: don't store the draft KV in context checkpoints | #29509 |
+| `9ffdbe1d4` | cuda: keep the decode-only SSM fusions off by default | #28768 |
+| `fa3fedc90` | server: fall back to full prompt re-processing when memory rollback fails | #28007 |
+| `2a09574f5` | cuda: `__vsub4` in the non-HIP Q6_K mmvq VDR=2 kernel | follow-up to #29478 |
+| `16dbe3320` | ci: `f711-rocm` workflow (Windows, ROCm 10.0.0, gfx1201, `workflow_dispatch` only) | – |
+
+### Runtime configuration (as it ran in production)
+
+- Model: Qwen3.8-27B UD-Q5_K_XL (dense hybrid, Gated Delta Net + attention) with built-in MTP head, mmproj F16 on CPU (`--no-mmproj-offload`)
+- `-c 262144 -np 2 --kv-unified -fa on -ub 512 -b 1024 --cache-type-k q8_0 --cache-type-v q8_0`
+- Speculative decoding: `--spec-type draft-mtp --spec-draft-n-max 3`, **draft KV `-ctkd f16 -ctvd f16`**. On r149, a q8_0 draft KV allocates its own ~1 GiB FA staging arena (net +544 MiB, [stew675 #237](https://github.com/stew675/llama-cpp-rdna-boosts/issues/237), fixed in stew r156/r159).
+- No `GGML_CUDA_FA_STAGE_*` variables (they were added in stew r159).
+- `--cache-ram 10240 --ctx-checkpoints 8 --jinja` with a patched Qwen chat template, sampling `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 --presence-penalty 1.5`
+- Client: Claude Code via the Anthropic-compatible `/v1/messages` endpoint
+
+To roll back from r160: use the r149 binary with `-ctkd f16 -ctvd f16` and without the `GGML_CUDA_FA_STAGE_*` variables.
+
+### Measured in production (2026-10-27 13:32 → 2026-10-28 15:07, 6 server runs, 827 requests)
+
+| metric | value |
+|---|---|
+| prefill (prompts > 5k tokens) | 416–1017 t/s, median 877 t/s |
+| decode | median 46.0 t/s |
+| MTP draft acceptance | median 0.723 |
+| longest context | 202,834 tokens |
+| WDDM shared memory | grew by ~500 MiB/h (1,953 MiB after 2.7 h); r160 stays flat at ~1.26 GB |
+| errors | no crashes; 2× `failed to prepare attention ubatches`, the server kept running |
+
+Release gate (2026-10-27) against r100: PPL 1.8683 (r100 1.8680), greedy output hashes identical, MTP decode 51.4 t/s at 90/109 accepted, two slots: slot B after a long slot A +21 % tg. The only failing `test-backend-ops` case is SOLVE_TRI, a known test artifact (ggml-org/llama.cpp#31108).
+
+### Building
+
+Run the `f711-rocm` workflow (Actions → f711-rocm → Run workflow) on this branch. The defaults are ROCm 10.0.0 and `AMDGPU_TARGETS=gfx1201`.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
