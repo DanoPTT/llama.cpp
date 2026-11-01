@@ -32,16 +32,16 @@ struct moe_cache_slru {
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
-        this->n_expert = n_expert;
-        this->n_slots  = n_slots;
+    void init(int32_t n_layer, int32_t n_expert_l, int32_t n_slots_l) {
+        this->n_expert = n_expert_l;
+        this->n_slots  = n_slots_l;
         slot_map.assign(n_layer, nullptr);
-        key_of.assign(n_slots, -1);
-        prev.resize(n_slots);
-        next.resize(n_slots);
-        for (int32_t s = 0; s < n_slots; ++s) {
+        key_of.assign(n_slots_l, -1);
+        prev.resize(n_slots_l);
+        next.resize(n_slots_l);
+        for (int32_t s = 0; s < n_slots_l; ++s) {
             prev[s] = s - 1;
-            next[s] = s + 1 < n_slots ? s + 1 : -1;
+            next[s] = s + 1 < n_slots_l ? s + 1 : -1;
         }
         head[0] = 0;
         tail[0] = n_slots - 1;
@@ -265,7 +265,7 @@ struct llama_moe_cache::impl {
         if (devices.empty()) {
             throw std::runtime_error("MoE cache requires a GPU backend");
         }
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (llm_split_mode_is_tensor_like(model.split_mode())) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
@@ -365,9 +365,9 @@ struct llama_moe_cache::impl {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
         }
 
-        auto init_ctx = [](size_t n_tensors) {
+        auto init_ctx = [](size_t n_tensors_l) {
             ggml_init_params params = {
-                /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
+                /*.mem_size   =*/ n_tensors_l*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -493,14 +493,14 @@ struct llama_moe_cache::impl {
         log_stats();
     }
 
-    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+    ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used_l) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const layer & l = layers[il];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used_l, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
             return nullptr;
         }
         return l.slot_map;
