@@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_type_draft_mtp = params.speculative.has_mtp();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -2719,11 +2717,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"--host-experts"}, "MODE",
+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+        "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
+        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default 25% of the host expert bytes).\n"
+        "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+        "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
+        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+            else if (value == "pool")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_POOL;   }
+            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ));
+    add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- auto: on, but only for tensors larger than 4 GiB; the optional managed host-arena\n"
+        "        PLE reader is enabled with LLAMA_LAZY_BUF_MB=<MiB>\n"
+        "- off: always keep them resident, even with a mapped load (--load-mode mmap):\n"
+        "       the tensors are read into host RAM instead of being served from the mapping",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
@@ -2777,11 +2794,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU (set\n"
+        "LLAMA_HOST_EXPERTS_FROM_END=0 to restore the historical first-N placement)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -2826,12 +2845,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor,relaxed-tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "- relaxed-tensor: tensor split that also admits a replicated tensor whose values differ per GPU\n"
+        "  (a per-device scalar, undone per GPU before the reduction). Not bit-identical to a single GPU\n"
+        "  on backends whose src1 rescale is non-linear; needed for the MoE amax arches (flint, mellum,\n"
+        "  mistral4), which plain tensor split refuses",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2841,6 +2864,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "tensor") {
                 params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else if (value == "relaxed-tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_RELAXED_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -4140,12 +4165,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            "(default: follows the main model's --cache-type-k, so lowering the main KV type for VRAM "
+            "takes the draft with it; set this to pin the draft's own type)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4153,12 +4179,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            "(default: follows the main model's --cache-type-v, so lowering the main KV type for VRAM "
+            "takes the draft with it; set this to pin the draft's own type)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -4176,25 +4203,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
         {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU for the draft model",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.speculative.draft.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d, max: 15)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            // Values above 15 are clamped, and values above 7 get a purity notice, in
+            // common_init_from_params - not here: argument-parser callbacks cannot know the final
+            // verbosity, and the notice belongs with the other range validation.  The 15 cap is the
+            // recurrent rollback snapshot bound (a verify batch decodes n_max + 1 rows and is a
+            // K <= 16 batch); above 7 the flash-attention chooser switches kernel family above 8
+            // rows, which can change greedy output between --spec-type none and draft-mtp.  Both
+            // notices are W level: llama-server's default INFO threshold shows them, while
+            // llama-cli's default ERROR threshold hides them (-lv 2 to see them).
             params.speculative.draft.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-vocab"}, "N",
+        string_format("MTP: compute draft logits over token ids < N plus control tokens only; verification is unchanged "
+                      "(0 = full vocabulary, default: %d)", params.speculative.draft.mtp_vocab),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_vocab = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
@@ -4212,6 +4256,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ubatch = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-n-start"}, "N",
+        "initial adaptive MTP draft depth: the first verify round of each generation starts here "
+        "instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, "
+        "--spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. "
+        "verbatim recall) or shallower for a short generation at a deep context, where a wide "
+        "verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_start = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_START"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
