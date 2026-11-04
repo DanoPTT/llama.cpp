@@ -1,3 +1,63 @@
+> [!NOTE]
+> **This is the DanoPTT fork of llama.cpp for one AMD Radeon AI PRO R9700** (gfx1201, RDNA4, ROCm/HIP, Windows 11).
+> It is not an official llama.cpp build. The upstream README continues below the fork section.
+
+## Fork: production build (as of 2026-11-04)
+
+**Branch `f711-rdna-r209-stack1104`** (the default branch of this fork, in production since 2026-11-04; the binary is built from `302e34d83`, the commit after it only adds this README section):
+
+- upstream llama.cpp `6050b467c`
+- [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) release `v16-6050b467c-r209` (tree `8c6c992d`), commit `453a90c99`
+- 10 carry commits on top:
+
+| commit | change | upstream |
+|---|---|---|
+| `cc2efb275` | server: clear stale state when reusing LRU-selected slots | #27624 |
+| `7fba3e56f` | server: consult the prompt cache when the outgoing state is not worth saving | port of #28992 |
+| `288c89e91`, `681a867a2` | server: emit tool results before user text in Anthropic `/v1/messages` conversion (+ test) | #29482 |
+| `cb39199d4` | server: don't store the draft KV in context checkpoints | #29509 |
+| `4eb52df4f` | cuda: keep the decode-only SSM fusions off by default | #28768 |
+| `dea8653cd` | server: fall back to full prompt re-processing when memory rollback fails | #28007 |
+| `c5da58b38` | cuda: `__vsub4` in the non-HIP Q6_K mmvq VDR=2 kernel | follow-up to #29478 |
+| `302e34d83` | spec: save and restore the MTP hidden state with context checkpoints | cherry-pick of #30141 |
+| `86130baaf` | ci: `f711-rocm` workflow (Windows, ROCm 10.0.0, gfx1201, `workflow_dispatch` only) | – |
+
+Rollback branch: `f711-rdna-r205-stack1102` (stew r205, the same carry set without #30141).
+
+New against r205, relevant for this setup: the Windows host-memory fold from stew675/llama-cpp-rdna-boosts#269 (r209). The model mapping's pages are now dropped from the working set once each tensor is on the GPU, and `cudaMemGetInfo` reports the WDDM free figure. r206–r208 are MoE / RDNA2 changes and are inert on this dense model and gfx1201.
+
+### Runtime configuration
+
+- Model: Qwen3.8-27B UD-Q5_K_XL (dense hybrid, Gated Delta Net + attention) with built-in MTP head, loaded via mmap, mmproj F16 on CPU (`--no-mmproj-offload`)
+- `-c 262144 -np 2 --kv-unified -fa on -ub 512 -b 1024 --cache-type-k q8_0 --cache-type-v q8_0`
+- Speculative decoding: `--spec-type draft-mtp --spec-draft-n-max 3`, draft KV `-ctkd q8_0 -ctvd q8_0`, default MTP draft window (64k tokens per sequence, 132 096 draft KV cells)
+- `--cache-ram 10240 --ctx-checkpoints 8 --jinja` with a patched Qwen chat template, sampling `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 --presence-penalty 1.5`
+- Environment: `GGML_CUDA_ASYNC_INPUT=1`, `GGML_CUDA_FA_STAGE_PREALLOC=2`, `GGML_CUDA_FA_STAGE_MAX_MB=256` (without the last two, pp at 100k drops ~24 % and WDDM shared memory grows to ~2.9 GB)
+- Client: Claude Code via the Anthropic-compatible `/v1/messages` endpoint
+
+### Release gate (2026-11-04, against r205)
+
+Greedy requests on the production launcher, fresh server per run, arms interleaved.
+
+| metric | r205 | r209 |
+|---|---|---|
+| host working set after load (of which file pages) | 20.11 GB (18.52 GB) | **1.65 GB (0.06 GB)** |
+| available RAM after a 100k request (47 GB host) | 16.67 GB | **35.07 GB** |
+| prefill, 100k-token prompt | 768–783 t/s | 775–791 t/s |
+| decode with MTP, 100k-token prompt | 50.7–50.9 t/s | 50.6–50.7 t/s |
+| MTP acceptance, 100k tokens | 90/111 | 90/111 |
+| decode / prefill at 8k–108k depth (llama-bench) | – | within ±1 % of r205 |
+| VRAM dedicated / WDDM shared after a 100k request | 31 161 / 643 MiB | 31 161 / 643 MiB |
+| perplexity (Q6_K, q8_0 KV, 8 chunks) | 1.8683 | 1.8683, identical per chunk |
+
+Greedy output hashes are identical to r205. The two-slot, cache-restore, vision and tool-use checks give the same results as r205 in all 27 requests. `GGML_CUDA_WDDM_FREE=0` makes no difference here. The only failing `test-backend-ops` case is SOLVE_TRI, a known test artifact (ggml-org/llama.cpp#31108). Windows results were posted to stew675/llama-cpp-rdna-boosts#269.
+
+### Building
+
+Run the `f711-rocm` workflow (Actions → f711-rocm → Run workflow) on the production branch. The defaults are ROCm 10.0.0 and `AMDGPU_TARGETS=gfx1201`.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
