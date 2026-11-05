@@ -89,11 +89,20 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// the prompt of `seq_id` about to be processed ends at position `n_prompt` (exclusive); lets the MTP draft limit its
+// prompt ingestion (LLAMA_MTP_INGEST_TAIL)
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// report a partial acceptance that the context could not apply (checkpoint-restore
+// path); the full accept() will not be called for this round, so implementations
+// with cross-round state (e.g. the adaptive depth controller) get the feedback here
+void common_speculative_accept_partial(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
@@ -102,14 +111,40 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// TODO #59: clamp the draft length of every DRAFTLESS (n-gram) speculator to `cap` tokens, so a verify
+// batch (`n_draft + 1` rows) can stay inside the MoE expert cache's decode/verify band.
+//
+// `--spec-ngram-mod-n-max` and the ngram-map family's `size_m` are unbounded width controls (48..64 by
+// default); the MTP/draft family is already bounded to 15 by `LLAMA_SPEC_DRAFT_N_MAX_CLAMP`.  Above the
+// arena band the cache stops serving the routed `MUL_MAT_ID` from VRAM and the routed experts are
+// streamed from the pinned host master on every verify step, which on a host-expert config costs far
+// more than the extra accepted tokens buy (measured 2x R9700 `-ncmoe 36`, Flash-Next IQ4_NL, `-n 2000`:
+// 159.2 t/s at a 16-row verify vs 55.0 t/s at 17 rows).  `common_init_from_params` calls this with
+// `band - 1` when the target model's cache is active; a device-resident or CPU-expert config reports no
+// band and is never clamped (there the wide draft IS the win: 144.7 -> 378.7 t/s measured).
+//
+// `ngram-cache` has a fixed 8-token draft and no knob, so it is left alone.  `n_min` is lowered with
+// `n_max` (ngram-mod discards a draft shorter than `n_min`, so a naked `n_max` clamp would silently
+// disable it on the default `n_min 48`).  Returns true when anything was clamped.
+bool common_speculative_clamp_ngram_n_max(common_params_speculative * spec, int32_t cap);
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
 
+// wip/slab-transient-absorption (step 4): load the draft MODEL only.  `common_init_result` calls this
+// BEFORE creating the target context, so the draft's weights are resident when the slab sizes itself from
+// the free VRAM it measures -- their per-device (asymmetric) footprint is then measured, not predicted.
+// The draft CONTEXT still comes after the target context (it needs `ctx_other`).  Returns nullptr when the
+// speculation runs on the target's own weights (MTP) or there is no draft.
+llama_model_ptr common_speculative_load_model(common_params & params);
+
 struct common_speculative_init_result {
-    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    // `model_dft` (optional) is an already loaded draft model; ownership is transferred here.
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                   llama_model * model_dft = nullptr);
     ~common_speculative_init_result();
 
     llama_model   * model();
@@ -122,4 +157,5 @@ private:
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                       llama_model * model_dft = nullptr);
