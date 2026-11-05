@@ -25,6 +25,10 @@
 #define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
 #define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED hipMemAllocationGranularityRecommended
+#define CU_MEM_ALLOC_GRANULARITY_MINIMUM hipMemAllocationGranularityMinimum
+// wip/kv-residency (TODO #118): the mixed-backing KV (part of one VA reservation in system RAM) needs the
+// host-location prop.  CUDA's own headers define the same two names, so this only adds the HIP mapping.
+#define CU_MEM_LOCATION_TYPE_HOST hipMemLocationTypeHost
 #define CU_MEM_ALLOCATION_TYPE_PINNED hipMemAllocationTypePinned
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
@@ -64,6 +68,7 @@
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
+#define cudaEventQuery hipEventQuery
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
 #define cudaFree hipFree
@@ -79,12 +84,18 @@
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaMemoryTypeManaged hipMemoryTypeManaged
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy
@@ -97,7 +108,13 @@
 #define cudaMemcpyKind hipMemcpyKind
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+#if defined(_WIN32)
+// hipMemGetInfo does not count other processes' memory on Windows; this one also asks WDDM (wddm-mem.cu)
+hipError_t ggml_hip_mem_get_info(size_t * free, size_t * total);
+#define cudaMemGetInfo ggml_hip_mem_get_info
+#else
 #define cudaMemGetInfo hipMemGetInfo
+#endif
 #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
 #define cudaSetDevice hipSetDevice
 #define cuDeviceGet hipDeviceGet

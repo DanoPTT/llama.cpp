@@ -89,10 +89,40 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// wip/fit-slab-accounting (Phase 1): enumerate the REAL devices that own host-resident MoE expert
+// weights (the `moe_host_expert_bytes` map).  Under `-sm tensor` the model's device list is the
+// scheduler's Meta wrapper, so `llama_model_moe_host_expert_bytes()` sees 0 on every device; `--fit`
+// needs the per-real-device bytes to reserve the expert-cache arena and the slab headroom.
+LLAMA_API int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model);
+
+// Fill *dev/*bytes with the i-th host-expert device (map iteration order).  Returns false when i is out
+// of range.  Either out pointer may be null.
+LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                               ggml_backend_dev_t * dev, size_t * bytes);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// wip/kv-residency (TODO #118) B-A: the attendance pool's footprint -- `vram` is the compact device pool and
+// `ram` the pinned host mirror that holds the authoritative copy of the whole context (both 0 when off).
+// `--fit` uses it to report the split and to know the KV's VRAM does NOT grow with `-c` in this mode.
+LLAMA_API void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram);
 
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+
+// Parking (unified KV cache).  park = true moves the cells of an idle sequence to the top of the attention cache(s) of
+// mem: the sequences that are decoded keep the low cells, and attend over the same range at the same cell indices as
+// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
+// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
+// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
+// are copied on the device, so synchronize the context first.  A memory whose second cache mirrors the attention cells
+// (the qwen4exp/glm5-next indexer) moves both, or neither.
+LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
+
+// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
+// no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
+// attention cells, that cache as well.  A memory without an attention cache: true.
+LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
 
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
@@ -102,6 +132,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// Unmasked nextn rows of `seq_id` at positions < `pos` are not needed by the caller: a ubatch whose every row is
+// such a row skips the device->host copy of the nextn embeddings (and the readback wait).  Those host rows then hold
+// stale data.  0 (the default) = every row is needed.  Used by the MTP prompt-tail ingest (LLAMA_MTP_INGEST_TAIL);
+// the skip it enables is a bisect kill-switch away (LLAMA_MTP_TAIL_READBACK=0 reads every row again).
+LLAMA_API void llama_set_embeddings_nextn_from(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
@@ -139,6 +175,18 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
+LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
+// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
+// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
+LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
+// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+// last batch (its ctx_other) to read from the device layer inputs
+LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
+LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
@@ -147,10 +195,19 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
+// number of layers that attend over a sliding window of llama_model_n_swa() positions
+LLAMA_API int32_t llama_model_n_layer_swa(const struct llama_model * model);
+
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// layers whose input embeddings contexts created from this model extract from the start (as if
+// llama_set_embeddings_layer_inp(ctx, lid, true) had been called before the context's first graph reserve).
+// For a target whose draft will turn the extraction on (DFlash): the compute buffers are then sized for it once,
+// instead of being freed and allocated again, larger, at the first decode after the draft attaches.
+LLAMA_API void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
@@ -164,3 +221,66 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+//
+// The windowed KV cache.
+//
+// `LLAMA_KV_RESIDENT_CELLS=<cells>` keeps the newest <cells> cells of the KV in VRAM and puts everything
+// older in pinned system RAM; `=auto` leaves the number to `--fit`, which sizes it against the device memory
+// it has left after the expert arena's reserve and the pinned-RAM ceiling on the spill.  Unset (or 0) = no
+// window: the KV takes the plain device buffer and the run is byte-identical to a build without this
+// feature, including its OOM.
+//
+// Is the KV region provider available (a device that offers VMM, and `LLAMA_KV_REGION=0` not given)?
+LLAMA_API bool llama_kv_region_is_enabled(void);
+
+// The window the cache would use: 0 = none, UINT32_MAX = `auto` (fit decides), else the cell count.
+// Reads the fit decision first, then the environment.
+LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
+
+// For `--fit`'s measurement context only: take a region buffer even with no window, so the fit can identify
+// the KV's bytes.  No batch ever runs on such a context.
+LLAMA_API void llama_kv_region_set_probe(bool on);
+
+// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
+// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
+LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
+
+//
+// The speculative draft's KV window (the MTP drafter's ring).
+//
+// The MTP draft context carries a KV cache of its own, sized `-c` cells, although the drafter only ever reads
+// its recent prefix (measured: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144` -- one draft layer).
+// `LLAMA_SPEC_DRAFT_WINDOW` makes it a sliding window instead, which is an APPROXIMATION the target verifies
+// (a wrong draft is a slower run, never a wrong answer).
+//
+//   unset / `auto`  the adaptive policy: a quarter of the context, clamped to [32768, 65536] cells -- a window
+//                   at or above the context the drafter actually works over costs nothing measurable, and one
+//                   far below it is a real 7-9 % decode loss, so the clamps are the safety rails
+//   `0`             no window: today's behaviour, byte-identical
+//   `N`             N cells (floored at one ubatch, and at the context where it would exceed it)
+//
+// Returns the PER-SEQUENCE window in cells, or 0 for "no window" (nothing to save at this context, or
+// disabled).  MTP only: a DFlash2/`-md` draft keeps its own `-c` cache.  This is the policy; the cache's cell
+// count comes from `llama_spec_draft_kv_cells()` below.
+LLAMA_API uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch);
+
+// The draft cache's geometry for that window, as the cache has to actually allocate it: writes the window the
+// cache will use to `win_out` (0 = no window, i.e. the full `-c` cache with `n_swa` 0) and returns its cell
+// count, 0 meaning "no window".
+//
+// The window is PER SEQUENCE, so a UNIFIED cache -- which holds every sequence in ONE stream -- must be sized
+// per sequence: `(win + one batch) x n_seq_max`, capped at the context.  Sizing it as `win + n_ubatch` while
+// several sequences share it is the r193 defect (issue #264): once the first sequence filled the window no
+// cell was left for a second sequence's batch, `find_slot` had no contiguous run to place it in and the server
+// answered `decode() failed: failed to process speculative batch` on that slot for every request.  A
+// per-stream cache (no `--kv-unified`) already sizes each stream separately, so its shape is unchanged.
+//
+// The window is lowered when `win` per sequence does not fit the context, and declined when what is left
+// cannot hold one batch: `LLAMA_SPEC_DRAFT_WINDOW` is a VRAM saving, never a reason a batch cannot be placed.
+LLAMA_API uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max,
+                                             bool kv_unified, uint32_t * win_out);
+
+// Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
+// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
+LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);

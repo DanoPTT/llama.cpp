@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <set>
 #include <vector>
 
@@ -52,6 +53,8 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+
+        n_multi = 0;
     }
 
     void reset_shift() {
@@ -102,6 +105,38 @@ public:
         return has_shift;
     }
 
+    // the index of the last used cell below lim + 1, 0 if none (the attention range when cells from lim up are parked)
+    uint32_t used_max_p1_below(uint32_t lim) const {
+        const auto it = used.lower_bound(lim);
+        return it == used.begin() ? 0 : *std::prev(it) + 1;
+    }
+
+    // move the non-empty cell isrc to the empty cell idst: its sequences, position, extension and shift go with it
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
+
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
+
+        seq_pos_rm(isrc);
+
+        pos  [idst] = pos  [isrc];
+        ext  [idst] = ext  [isrc];
+        shift[idst] = shift[isrc];
+        seq  [idst] = seq  [isrc];
+
+        pos  [isrc] = -1;
+        ext  [isrc].reset();
+        shift[isrc] = 0;
+        seq  [isrc].reset();
+
+        used.erase (isrc);
+        used.insert(idst);
+
+        seq_pos_add(idst);
+    }
+
     // move cell isrc to idst (used during defrag)
     //void mv(uint32_t isrc, uint32_t idst) {
     //    assert(isrc < pos.size());
@@ -137,6 +172,10 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
+            if (res.seq[j].count() > 1) {
+                res.n_multi++;
+            }
+
             assert(shift[idx] == 0);
         }
 
@@ -155,6 +194,10 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+
+            if (res.seq[j].count() > 1) {
+                res.n_multi++;
+            }
 
             assert(shift[idx] == 0);
         }
@@ -181,9 +224,17 @@ public:
                 seq_pos_rm(i + j);
             }
 
+            if (seq[idx].count() > 1) {
+                n_multi--;
+            }
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+
+            if (seq[idx].count() > 1) {
+                n_multi++;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -212,9 +263,17 @@ public:
                 seq_pos_rm(idx);
             }
 
+            if (seq[idx].count() > 1) {
+                n_multi--;
+            }
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+
+            if (seq[idx].count() > 1) {
+                n_multi++;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -230,6 +289,9 @@ public:
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
+        if (seq[i].count() > 1) {
+            n_multi--;
+        }
         seq[i].reset();
 
         pos[i] = -1;
@@ -247,6 +309,9 @@ public:
         assert(pos[i] != -1);
         assert(seq_id >= 0);
 
+        if (seq[i].count() == 2) {
+            n_multi--;
+        }
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
 
@@ -269,6 +334,9 @@ public:
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
 
             seq[i].set(seq_id);
@@ -279,6 +347,9 @@ public:
 
         if (seq[i].any()) {
             seq_pos_rm(i);
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
 
             pos[i] = -1;
@@ -301,6 +372,11 @@ public:
         assert(pos[i] != -1);
 
         return seq[i].count();
+    }
+
+    // the number of cells that carry more than one sequence
+    uint32_t get_n_multi_seq() const {
+        return n_multi;
     }
 
     // the full set of sequences this cell is visible to
@@ -352,6 +428,10 @@ public:
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
+
+        if (seq[i].count() == 2) {
+            n_multi++;
+        }
     }
 
     // return the sequence id of this cell
@@ -457,6 +537,9 @@ public:
         has_shift = true;
 
         if (pos[i] < 0) {
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
@@ -520,6 +603,9 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // the number of cells that carry more than one sequence (llama_memory_seq_cp); 0 lets kq_mask_derivable_seqs skip its scan
+    uint32_t n_multi = 0;
 
     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
