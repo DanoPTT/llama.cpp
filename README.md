@@ -1,3 +1,66 @@
+> [!NOTE]
+> **This is the DanoPTT fork of llama.cpp for one AMD Radeon AI PRO R9700** (gfx1201, RDNA4, ROCm/HIP, Windows 11).
+> It is not an official llama.cpp build. The upstream README continues below the fork section.
+
+## Fork: production build (as of 2026-11-06)
+
+**Branch `f711-rdna-r220-stack1105`** (the default branch of this fork, in production since 2026-11-06; the binary is built from `05cb99aff`, the commit after it only adds this README section):
+
+- upstream llama.cpp `6050b467c`
+- [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) release `v16-6050b467c-r220` (tree `e77a08d9`), commit `f1f043f28`
+- 10 carry commits on top:
+
+| commit | change | upstream |
+|---|---|---|
+| `bb15dae8e` | server: clear stale state when reusing LRU-selected slots | #27624 |
+| `1288db52e` | server: consult the prompt cache when the outgoing state is not worth saving | port of #28992 |
+| `52409be38`, `3f8b38290` | server: emit tool results before user text in Anthropic `/v1/messages` conversion (+ test) | #29482 |
+| `fe3c57000` | server: don't store the draft KV in context checkpoints | #29509 |
+| `0ab37ec3d` | cuda: keep the decode-only SSM fusions off by default | #28768 |
+| `b55e6bc2c` | server: fall back to full prompt re-processing when memory rollback fails | #28007 |
+| `facccd230` | cuda: `__vsub4` in the non-HIP Q6_K mmvq VDR=2 kernel | follow-up to #29478 |
+| `05cb99aff` | spec: save and restore the MTP hidden state with context checkpoints | cherry-pick of #30141 |
+| `344abff74` | ci: `f711-rocm` workflow (Windows, ROCm 10.0.0, gfx1201, `workflow_dispatch` only) | – |
+
+Rollback branch: `f711-rdna-r209-stack1104` (stew r209, the same carry set).
+
+New against r209, relevant for this setup:
+- r217 (stew675/llama-cpp-rdna-boosts#273): stall padding for two small grids on gfx1201, `seq_rm` no longer scans the whole cache when an idle slot is parked, the drafter prompt copy is skipped per step, `getenv` reads on hot paths are latched.
+- r218 (#272): the speculative drafters keep their own KV contiguous when a prompt is partially reused (`spec_draft_align_cache`).
+- r220 (#268): the scheduler uses a per-copy event ring for cross-backend copies (`GGML_SCHED_COPY_EVENT=shared` restores the old path).
+- r219 (#274, Windows host-expert pool) and r210–r216 are MoE / multi-GPU changes and are inert on this dense model.
+
+### Runtime configuration
+
+- Model: Qwen3.8-27B UD-Q5_K_XL (dense hybrid, Gated Delta Net + attention) with built-in MTP head, loaded via mmap, mmproj F16 on CPU (`--no-mmproj-offload`)
+- `-c 262144 -np 2 --kv-unified -fa on -ub 512 -b 1024 --cache-type-k q8_0 --cache-type-v q8_0`
+- Speculative decoding: `--spec-type draft-mtp --spec-draft-n-max 3`, draft KV `-ctkd q8_0 -ctvd q8_0`, default MTP draft window (64k tokens per sequence, 132 096 draft KV cells)
+- `--cache-ram 16384 --ctx-checkpoints 8 --jinja` with a patched Qwen chat template, sampling `--temp 0.7 --top-p 0.8 --top-k 20 --min-p 0 --presence-penalty 1.5`
+- Environment: `GGML_CUDA_ASYNC_INPUT=1`, `GGML_CUDA_FA_STAGE_PREALLOC=2`, `GGML_CUDA_FA_STAGE_MAX_MB=256` (without the last two, pp at 100k drops ~24 % and WDDM shared memory grows to ~2.9 GB)
+- Client: Claude Code via the Anthropic-compatible `/v1/messages` endpoint
+
+### Release gate (2026-11-05, against r209)
+
+Greedy requests on the production launcher, fresh server per run, arms interleaved.
+
+| metric | r209 | r220 |
+|---|---|---|
+| prefill, 100k-token prompt | 770 t/s | 772 t/s |
+| decode with MTP, 100k-token prompt | 51.05 t/s | 50.95 t/s |
+| MTP acceptance, 100k tokens | 90/111 | 90/111 |
+| decode / prefill at 8k–110k depth (llama-bench) | – | −0.2 % to +0.5 % of r209 |
+| long idle conversation before the active one | 19.24 ms/token | 19.04 ms/token |
+| available RAM after a 100k request (47 GB host) | 38.7 GB | 38.78 GB |
+| perplexity (Q6_K, q8_0 KV, 8 chunks) | 1.8683 | 1.8683, identical per chunk |
+
+Greedy output hashes are identical to r209. The two-slot, cache-restore, vision and tool-use checks give the same results as r209 in all 27 requests. `GGML_SCHED_COPY_EVENT=shared` is byte-identical. The only failing `test-backend-ops` case is SOLVE_TRI, a known test artifact (ggml-org/llama.cpp#31108).
+
+### Building
+
+Run the `f711-rocm` workflow (Actions → f711-rocm → Run workflow) on the production branch. The defaults are ROCm 10.0.0 and `AMDGPU_TARGETS=gfx1201`.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
