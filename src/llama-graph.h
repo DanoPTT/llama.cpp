@@ -47,6 +47,7 @@ enum llm_graph_type {
 
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
+    LLM_FUSED_OP_FLASH_ATTN_DERIVED, // V3: flash attention fed by the derived kq mask (no packed mask)
     LLM_FUSED_OP_GDN_AR,
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -100,6 +101,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_mtp_draft_vocab;
 
 //
 // llm_graph_input
@@ -108,8 +110,12 @@ struct llm_graph_params;
 class llm_graph_input_i {
 public:
     llm_graph_input_i() {
-        const char * LLAMA_GRAPH_INPUT_DEBUG = getenv("LLAMA_GRAPH_INPUT_DEBUG");
-        debug = LLAMA_GRAPH_INPUT_DEBUG ? atoi(LLAMA_GRAPH_INPUT_DEBUG) : 0;
+        // read once: a graph input object is constructed on every decode; getenv() is expensive on Windows
+        static const int input_debug = [] {
+            const char * env = getenv("LLAMA_GRAPH_INPUT_DEBUG");
+            return env != nullptr ? atoi(env) : 0;
+        }();
+        debug = input_debug;
     }
 
     virtual ~llm_graph_input_i() = default;
@@ -294,6 +300,13 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // rollback snapshots: the rows of planes 1..n_rs_seq of the source cells of the extra states, plane-major, so
+    // a moved extra state keeps its snapshots (nullptr without snapshots or extra states)
+    ggml_tensor * s_copy_extra = nullptr; // I32 [n_rs_seq * (n_rs - n_seqs)]
+
+    // fill s_copy_extra
+    void set_extra_input(const llama_memory_recurrent_context * mctx_r);
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -406,6 +419,39 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    const llama_kv_cache_context * mctx;
+};
+
+// V3 derived kq mask: the compact per-cell state that can replace the packed
+// [n_kv, n_tps, 1, n_stream] kq mask.  flash attention derives each cell's visibility from
+// cell_pos[j] vs [tok_lo[i], tok_hi[i]] instead of loading the mask from memory.
+//
+// the packed mask tensor is still created by the graph builder (so every consumer keeps working
+// unchanged) - it simply ends up without consumers when the derived form is used, and the gallocr
+// then leaves it unallocated (no VRAM, no host copy, no per-ubatch fill).
+class llm_graph_input_kq_derived : public llm_graph_input_i {
+public:
+    llm_graph_input_kq_derived(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_kq_derived() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * cell_pos = nullptr; // I32 [n_kv, n_stream]
+    ggml_tensor * tok_lo   = nullptr; // I32 [n_tps, n_stream]
+    ggml_tensor * tok_hi   = nullptr; // I32 [n_tps, n_stream]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -813,6 +859,8 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -874,6 +922,17 @@ struct llm_graph_params {
             return false;
         }
 
+        // Llama-Frankenstein F1: a device-feature injection graph is not a drafting graph
+        if (cparams.lf_dev_inject != other.cparams.lf_dev_inject) {
+            return false;
+        }
+
+        // F1 (issue #240): an armed layer-input store changes the graph (a SET_ROWS per extracted layer instead
+        // of an output), so a graph built without them must not be reused once they exist
+        if (cparams.lf_layer_inp_dev_store.empty() != other.cparams.lf_layer_inp_dev_store.empty()) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -902,6 +961,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.mtp_draft_vocab         == other.cparams.mtp_draft_vocab         &&
+            mtp_draft == other.mtp_draft &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -929,6 +990,15 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+
+    // F1 (issue #240): the row-index input the in-graph layer-input stores write through, when they are armed
+    ggml_tensor * get_lf_rows() const { return t_lf_rows; }
+
+    // Record the input of layer `il`.  This replaces the direct `t_layer_inp[il] = t` assignment in the arch
+    // graphs so the layer-input extraction window can be closed: with F1's device stores armed, the previous
+    // layer's input is copied into its store as soon as the layer that reads it is complete, instead of being
+    // kept alive (as a graph output) to the end of the graph.
+    void set_layer_inp(int il, ggml_tensor * t);
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -968,6 +1038,7 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    ggml_tensor * t_lf_rows = nullptr; // I32 [n_tokens]: this batch's rows in the layer-input stores
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -989,6 +1060,17 @@ public:
     int64_t max_nodes;
 
 private:
+    // F1 (issue #240): write t_layer_inp[il] into its persistent device store from inside the graph, and expand
+    // the layer's own nodes first so the copy lands right after them in the graph order (the allocator frees a
+    // tensor after its last consumer, so that position is what lets it reuse the layer input's buffer)
+    void lf_emit_layer_inp_store(int il);
+
+    // the layer whose input is recorded but whose copy is not emitted yet (-1 = none)
+    int  lf_pending_il = -1;
+
+    // true when the target context armed its persistent layer-input stores (cparams.lf_layer_inp_dev_store)
+    bool lf_store_armed = false;
+
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph
@@ -1016,6 +1098,13 @@ struct llm_graph_qkv {
 struct llm_graph_amax_src1 {
     ggml_tensor * res;     // cur rescaled
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
+};
+
+// V3: the compact inputs that replace a packed kq mask in the flash attention op
+struct llm_graph_kq_derived {
+    ggml_tensor * cell_pos = nullptr;
+    ggml_tensor * tok_lo   = nullptr;
+    ggml_tensor * tok_hi   = nullptr;
 };
 
 struct llm_graph_context {
@@ -1071,9 +1160,17 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // V3 derived kq mask: the masks that may be replaced by their derived form, keyed by the mask
+    // tensor. build_attn_mha() consumes the entry (if any) when it builds the flash attention node,
+    // so any other consumer of the mask keeps working and simply forces the packed mask to be
+    // materialized by the allocator (it has a consumer, hence it is allocated and filled).
+    mutable std::map<const ggml_tensor *, llm_graph_kq_derived> kq_derived;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1284,6 +1381,19 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    std::unique_ptr<llm_graph_input_attn_kv>  build_attn_inp_kv_impl     (const llama_kv_cache_context *     mctx) const;
+    std::unique_ptr<llm_graph_input_attn_k>   build_attn_inp_k_impl      (const llama_kv_cache_context *     mctx) const;
+    std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(const llama_kv_cache_dsa_context * mctx) const;
+
+    // V3: build the kq mask for the given cache context. when the derived form is possible
+    // (allow_derived and every runtime gate passes) a compact state input is added to the graph and
+    // registered in kq_derived, keyed by the returned mask tensor
+    ggml_tensor * build_attn_inp_kq_mask(
+            const llama_kv_cache_context * mctx,
+            const llama_ubatch & ubatch,
+            const llama_cparams & cparams,
+            bool allow_derived) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
