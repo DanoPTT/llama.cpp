@@ -47,17 +47,17 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
     for (int i = 0; i < n_layer_nextn; ++i) {
         auto & layer = layers[i];
 
-        const int64_t n_head      = hparams.n_head(i);
+        const int64_t n_head_l      = hparams.n_head(i);
         const int64_t n_embd_head = hparams.n_embd_head_k(i);
-        const int64_t n_ff        = hparams.n_ff(i);
+        const int64_t n_ff_l        = hparams.n_ff(i);
 
         if (i == 0) {
             nextn_proj_pre = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_PRE, "weight", i), { 2*n_embd_backbone, n_embd }, 0);
         }
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
-        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), { n_embd, n_embd_head*n_head }, 0);
-        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), { n_embd_head*n_head, n_embd }, 0);
+        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), { n_embd, n_embd_head*n_head_l }, 0);
+        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), { n_embd_head*n_head_l, n_embd }, 0);
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), { n_embd_head }, 0);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
@@ -70,9 +70,9 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         }
 
         layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, 0);
-        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff, n_embd }, 0);
+        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff_l }, 0);
+        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff_l }, 0);
+        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff_l, n_embd }, 0);
         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, 0);
     }
 }
@@ -193,7 +193,21 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    ggml_tensor * logits;
+    if (mtp_draft != nullptr && model.output == mtp_draft->src && n_outputs == 1) {
+        // --spec-draft-mtp-vocab: this context drafts over a row subset of the LM head (the assistant's tied
+        // token embedding) and scatters its logits into a full-vocab row of -inf, as the qwen35/qwen35moe/
+        // qwen4exp MTP graphs do.  Only the draft changes; the target still verifies the full vocabulary.
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur);
+        logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        logits = ggml_set_rows(ctx0, logits, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        logits = ggml_reshape_2d(ctx0, logits, n_row, 1);
+    } else {
+        logits = build_lora_mm(model.output, cur);
+    }
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 
