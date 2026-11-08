@@ -196,9 +196,13 @@ bool moe_cache_is_sized();
 // and `split_axis` is the master's split axis (0/1, or -1 for an unsplit whole-expert table).  For a
 // contiguous axis-1 slice `host_pitch` is 0 and the fill is one 1-D copy; for a strided axis-0 slice
 // `host_pitch` is the host row pitch and the fill is a 2-D copy.
+// wip/fix-gemma-4 (TODO #77/C): `slices`/`n_slices` describe a FUSED table whose device slot is the
+// concatenation of several ranges of the host expert blob (gemma4 `ffn_gate_up_exps` under `-sm tensor`).
+// `n_slices == 0` keeps the historical single-slice geometry (`src_off`/`host_pitch`/`split_axis`).
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
-                    const void * host, int device);
+                    const void * host, int device,
+                    const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // wip/host-expert-dio-cache Phase 1 (plumbing, inert): register the on-disk source of a host-resident
 // expert tensor, keyed by its host data pointer (== the `host` passed to `moe_cache_table`).  Called by
@@ -272,7 +276,8 @@ bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_te
 bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
-                           int device, size_t slice_off, int split_axis);
+                           int device, size_t slice_off, int split_axis,
+                           const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // Host-weight expert gather (B2, session 15).  For a `-ncmoe` `MUL_MAT_ID` prefill whose expert upload is
 // NOT staged, copy only the routed experts from the host master into the scheduler's device `input_cpy`,
@@ -304,6 +309,16 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
 bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor * weight_cpy, int device,
                          void ** arena, int64_t * n_slots,
                          size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
+
+// TODO #335/#336: repair a take-over's broken promise.  `moe_cache_take_over` / `moe_cache_update_host` /
+// `moe_cache_remap_dev` tell the scheduler it may skip filling `input_cpy`, and the slab can still evict the
+// table's arena BETWEEN that hook and the consumer's launch (the eviction runs from inside a graph, when an
+// op's workspace allocation moves the work boundary).  A consumer whose `moe_cache_get_table` then declined
+// calls this with the same (redirected) tensor: when the outstanding promise is for THIS buffer, the table's
+// whole master is copied back into it from the host source and the number of bytes re-filled is returned (0
+// when there was no promise, i.e. the scheduler filled the buffer itself).  Runs on the caller's compute
+// stream, so it is ordered before the kernel that reads the buffer.
+size_t moe_cache_repair_copy(const struct ggml_tensor * weight_cpy, int device, void * stream);
 
 // Structural takeover for the decode/verify band: true when the table is cache-managed and the consumer
 // can read the arena without the host routing (an identity table, served with the raw ids).  Every other
