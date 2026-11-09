@@ -24,6 +24,21 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <cstdlib>
+
+// stew block 11 exports LLAMA_LAZY_BUF_MB with the POSIX calls; the MSVC CRT has only _putenv_s
+static int setenv(const char * name, const char * value, int overwrite) {
+    if (!overwrite && getenv(name) != nullptr) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+static int unsetenv(const char * name) {
+    return _putenv_s(name, ""); // an empty value removes the variable
+}
+#endif
+
 static bool arch_matches(const std::string & filter, llm_arch arch) {
     if (filter.empty()) {
         return true;
