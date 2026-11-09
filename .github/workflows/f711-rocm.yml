@@ -82,6 +82,15 @@ jobs:
 
           echo "C:\TheRock\build\.venv\Scripts" >> $env:GITHUB_PATH
 
+          # Upstream #31329 (d63fbfe79) embeds an app manifest in every Windows exe. With clang++ in MSVC ABI
+          # mode the manifest goes to lld-link, which needs mt.exe from the Windows SDK to merge it. Upstream's
+          # ROCm release job builds only ggml-hip, so it never links an exe; this workflow builds the tools too.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) { throw "mt.exe not found in the Windows SDK" }
+          write-host "mt.exe: $($mt.FullName)"
+          echo "$($mt.DirectoryName)" >> $env:GITHUB_PATH
+
       - name: Build
         run: |
           mkdir build
