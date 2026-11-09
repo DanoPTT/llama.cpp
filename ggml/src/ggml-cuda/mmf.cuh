@@ -9,6 +9,11 @@ using namespace ggml_cuda_mma;
 
 #define MMF_ROWS_PER_BLOCK 32
 #define MMF_ROWS_PER_BLOCK_CDNA 64
+// Column-tile width of the compact-ids kernel.  mmf.cu builds the per-expert seam/tile_spec grid with this
+// stride and sizes max_tiles from it, so mul_mat_f_ids MUST be dispatched with cols_per_block == this value;
+// a narrower one (which ncols_dst < 16 used to produce) processes only that many of each tile's columns and
+// silently drops the tail of every expert's compact range (TODO #304).
+#define MMF_IDS_COLS 16
 
 static __forceinline__ int64_t mmf_get_max_block_size(int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -598,9 +603,10 @@ static inline void mul_mat_f_switch_ids(
         const mmf_ids_data * ids_data) {
     const bool has_ids_data = ids_data && ids_data->ids_src_compact;
 
-    // Use the compact-ids kernel only for larger tiles; for small ncols_dst (< 16)
-    // we prefer the normal mul_mat_f path with has_ids=true.
-    if (has_ids_data && ncols_dst > 16) {
+    // Use the compact-ids kernel for every MUL_MAT_ID: the non-compact mul_mat_f path keeps a single slot per token,
+    // so it cannot represent repeated ids within a token's row.  The compact kernel maps every (token, slot) occurrence
+    // to its own row.  For small ncols_dst the extra tile_spec read is negligible.
+    if (has_ids_data) {
         if (ids_data->max_tiles == 0) {
             return;
         }
@@ -756,7 +762,11 @@ static void mul_mat_f_switch_cols_per_block(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         cudaStream_t stream, const mmf_ids_data * ids_data) {
 
-    const int ncols_case = (ids && ncols_dst > 16) ? 16 : ncols_dst;
+    // With a compact id list the kernel's column tile is fixed by the seam grid (MMF_IDS_COLS), not by
+    // ncols_dst: the list holds one row per (token, slot) occurrence, so an expert's range can be much
+    // wider than the token count.  The non-compact ids path and plain MUL_MAT still tile by ncols_dst.
+    const bool compact_ids = ids_data != nullptr && ids_data->ids_src_compact != nullptr;
+    const int ncols_case = compact_ids ? MMF_IDS_COLS : (ids && ncols_dst > 16) ? 16 : ncols_dst;
 
     GGML_ASSERT(ids || ncols_dst <= 16);
 
