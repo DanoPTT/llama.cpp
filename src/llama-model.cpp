@@ -23,6 +23,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -396,7 +398,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
     if (model != nullptr) {
         model->arch = arch;
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
-            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+            // [TAG_MOE_AMAX_SCALE] flint/mellum/mistral4 are denied here only because of the MoE amax
+            // rescale, whose row max no device can complete under a tensor split.  -sm relaxed-tensor
+            // admits the per-device scalar that results, so point at it instead of a dead end.
+            const bool amax_only = arch == LLM_ARCH_FLINT || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_MISTRAL4;
+            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") +
+                    llm_arch_name(arch) + "'" +
+                    (amax_only ? "; this arch's MoE amax rescale needs '-sm relaxed-tensor'" : ""));
         }
     }
 
@@ -415,7 +423,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
+    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
+    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
+    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
+    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
+    // name (every activation copy) is left alone and falls through to the mirrored default below.
+    std::string tensor_name = tensor->name;
+    {
+        const size_t first = tensor_name.find('#');
+        const size_t last  = tensor_name.rfind('#');
+        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
+            bool trailing_index = true;
+            for (size_t i = last + 1; i < tensor_name.size(); i++) {
+                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
+            }
+            if (trailing_index) {
+                // wip/tensor-split-expert-split experiment gate:
+                //   0 = off (r12 behaviour: the copy stays mirrored)
+                //   1 = every weight copy inherits its weight's split
+                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
+                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
+                static const int split_copy = [] {
+                    const char * e = getenv("GGML_META_SPLIT_COPY");
+                    return e != nullptr ? atoi(e) : 1;
+                }();
+                if (split_copy != 0) {
+                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
+                    const bool is_down = stripped.find("ffn_down_exps") != std::string::npos;
+                    // 2 = keep only the axis-0 down copies mirrored; 3 = the inverse bisection:
+                    // split only the axis-0 down copies, leave gate/up mirrored (tests the reduce path
+                    // in isolation).
+                    const bool axis0_only = split_copy == 2 && is_down;
+                    const bool down_only  = split_copy == 3 && !is_down;
+                    if (!axis0_only && !down_only) {
+                        tensor_name = stripped;
+                    }
+                }
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
@@ -1355,6 +1402,10 @@ struct llama_model::impl {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+    // `--lazy-mode mlock`: the pinned on-demand tables (page-cache residency).  Declared after
+    // `mappings` so the locks are gone before the mapping is unmapped; the kernel also releases
+    // them when the process exits, which returns the pages to ordinary reclaimable page cache.
+    llama_mlocks mlock_lazy;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1374,6 +1425,10 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // MTP draft vocabulary subsets by (n_keep, buffer type), alive while a context holds one
+    std::mutex mtp_draft_mutex;
+    std::map<std::pair<int32_t, ggml_backend_buffer_type_t>, std::weak_ptr<const llama_mtp_draft_vocab>> mtp_draft_cache;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1777,9 +1832,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1804,6 +1871,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         layers.resize(n_layer_all);
+
+        // wip/host-expert-tier: decide the `-lme` budget and WHICH host-expert tensors get a pinned master
+        // BEFORE any of them is placed.  Every input it needs (the tensor index, the `-ncmoe` selection, the
+        // heat prior, MemAvailable) is known here, and a per-tensor decision cannot be revisited once the
+        // buffers are allocated.
+        // NB: the `-ncmoe` tail bound is `hparams.n_layer()` (the TRUNK layers), not `n_layer_all` (which
+        // also counts the appended nextn/MTP head): `create_tensor` uses the trunk count, so using the other
+        // here would shift the tail by one layer and plan a pinned MTP head that is never hosted.
+        // A shared host/device memory pool (an integrated GPU) is ONE pool: hosting an expert set there buys
+        // nothing, and the tier that serves a host master is denied on such a device, so the consumer would
+        // read a page the GPU cannot address (measured on gfx1151: Qwen3.8-Flash-Next at `-ncmoe 24`/`48`
+        // faults in `mul_mat_q<Q2_0,16>` at a host address; the same arms fault on the pre-re-base r235
+        // binary).  `-ncmoe`/`-cmoe`/a CPU expert override is refused there and every weight stays on the
+        // device, which is the whole point of a unified pool.
+        {
+            bool umem = false;
+            for (const auto & d : devices) {
+                if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    umem = true;
+                    break;
+                }
+            }
+            if (umem) {
+                ml.set_host_experts_umem(true);
+            }
+        }
+
+        ml.plan_host_expert_placement((int) hparams.n_layer());
 
         // call the per-model loading function
         load_arch_tensors(ml);
@@ -1984,10 +2079,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml.moe_host_expert_bytes;
+
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+    // `--lazy-mode mlock`: the tables are on the lazy (mapped, on-demand) data path, so their whole
+    // extent is populated and pinned in the page cache now that the mapping exists.  The locks live
+    // in the model, not the loader (which is a temporary), and the kernel drops them at exit.
+    ml.lazy.mlock_ranges(ml.mappings);
+    pimpl->mlock_lazy = std::move(ml.lazy.locks);
+
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2024,10 +2129,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
-        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing.
+        // a resident context (explicit `--lazy-mode off` under a mapped load) must NOT be turned into
+        // a host-pointer buffer over the mapping -- that is the whole point of `off` -- so it takes
+        // the plain host-buffer path below and the loader reads its tensors into RAM.
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        const bool is_resident    = ctx_key.resident;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // wip/host-expert-master-drop (TODO #55): a POOL-BACKED host expert master keeps its tensors in
+        // the read-only model mapping instead of a full pinned allocation (`--host-experts pool`).  The
+        // mapping is the source of truth (page cache / GGUF on disk, reclaimable), the bounded pinned
+        // pool is the only non-swappable tier, and every GPU read is served through it -- so a host
+        // expert set larger than RAM runs by streaming from disk.  The buffer type still carries this
+        // device, so the expert op stays on the GPU and nothing about the schedule changes.
+        const bool host_master_mapped = ml.use_mmap && !ml.no_alloc && dev != nullptr && buft != nullptr &&
+            buft == ggml_backend_dev_moe_host_master_buft(dev);
+
+        if (host_master_mapped) {
+            const size_t max_size = ggml_get_max_tensor_size(ctx);
+
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                // the mmap regions that contain this context's tensors of this file (a pool-backed master
+                // can be split into several disjoint ranges, so one buffer per range)
+                void * addr = ml.mappings.at(idx)->addr();
+
+                for (const auto & range : ml.get_mapping_ranges(idx, ctx)) {
+                    ggml_backend_buffer_t buf = ggml_backend_host_buffer_from_ptr(
+                            buft, (char *) addr + range.first, range.last - range.first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to map %s buffer over the model mapping (range %zu..%zu); "
+                                                        "use --host-experts pinned or a smaller tensor layout",
+                                                        ggml_backend_buft_name(buft), range.first, range.last));
+                    }
+                    bufs.emplace_back(buf);
+                }
+            }
+
+            // the tensors point directly into the mapping: the pages must survive the load
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (w != nullptr) {
+                    ml.mark_mmap_used((uint32_t) w->idx, w->offs, ggml_nbytes(t));
+                }
+            }
+            if (bufs.empty()) {
+                throw std::runtime_error(format("host expert master: no mapped range covers the %s expert tensors",
+                                                ggml_backend_buft_name(buft)));
+            }
+        } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !is_resident) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
@@ -2046,6 +2195,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }
                     bufs.emplace_back(buf);
+                }
+            }
+
+            // record the exact mmap-backed ranges before any data is loaded, so the loader's
+            // per-tensor release never unmaps pages that a host-pointer tensor points into
+            // (a tied embedding is loaded once mmap-backed and once copied to a device)
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (w != nullptr) {
+                    ml.mark_mmap_used((uint32_t) w->idx, w->offs, ggml_nbytes(t));
                 }
             }
         } else {
@@ -2145,6 +2304,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    // wip/host-expert-tier: the tier census, once, after the placement is final.
+    ml.report_host_expert_placement();
 
     return true;
 }
@@ -2555,6 +2717,73 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     return ret;
 }
 
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
+}
+
+size_t llama_model::max_host_expert_slice_bytes() const {
+    // issue #164: the per-device slice of a host expert table is not the table divided by the device count
+    // -- the meta split is granularity-rounded and came out 180 MiB / 270 MiB on a 450 MiB table with two
+    // devices.  Ask the split-state callback (the same one the meta backend uses for the staging copies)
+    // and the shared size rule, so this and the staging always agree.
+    const size_t n_devs = get_split_state_ud.n_devices;
+    const bool   split  = n_devs > 1 && n_devs <= GGML_BACKEND_META_MAX_DEVICES && get_split_state_ud.model != nullptr;
+    size_t max_slice = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            if (std::string(t->name).find("exps") == std::string::npos) {
+                continue;
+            }
+            if (split) {
+                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
+                for (size_t d = 0; d < n_devs; d++) {
+                    const size_t b = ggml_backend_meta_split_dev_bytes(t, &ss, n_devs, d);
+                    if (b > max_slice) {
+                        max_slice = b;
+                    }
+                }
+            } else if (ggml_nbytes(t) > max_slice) {
+                max_slice = ggml_nbytes(t);
+            }
+        }
+    }
+    return max_slice;
+}
+
+// TODO #124: keep this in step with the split-state callback's own MIRRORED rule for `cache_k_*`/`cache_v_*`
+// (`llama_meta_device_get_split_state`, above): HRM_TEXT replicates every cache tensor, and dsv4
+// (DEEPSEEK4/41, or DFLASH with the hyper-connection state) mirrors the KV cache and its state tensors.
+bool llama_model::kv_cache_split_mirrored() const {
+    if (arch == LLM_ARCH_HRM_TEXT) {
+        return true;
+    }
+    return arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
+        (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -2888,6 +3117,149 @@ llama_rope_params llama_model::get_rope_params_indexer(const llama_cparams & cpa
     return res;
 }
 
+// A token id cutoff selects common tokens only if ids follow BPE merge order (an earlier merge is a more frequent pair).
+// Check it: the vocab must be BPE, and ids must increase with the rank of the first merge that makes each token.
+static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, std::string & why) {
+    if (vocab.get_type() != LLAMA_VOCAB_TYPE_BPE) {
+        why = "the tokenizer is not BPE";
+        return false;
+    }
+    const std::vector<std::string> merges = vocab.get_bpe_merges();
+    const int n_vocab = (int) vocab.n_tokens();
+    if (merges.size() < (size_t) n_vocab / 2) {
+        why = format("the tokenizer has only %zu merges for %d tokens", merges.size(), n_vocab);
+        return false;
+    }
+    std::vector<uint8_t> seen((size_t) n_vocab, 0);
+    llama_token prev = -1;
+    size_t n_first = 0;
+    size_t n_out_of_order = 0;
+    for (const std::string & m : merges) {
+        const size_t sp = m.find(' ');
+        if (sp == std::string::npos) {
+            continue;
+        }
+        const llama_token id = vocab.text_to_token(m.substr(0, sp) + m.substr(sp + 1));
+        if (id == LLAMA_TOKEN_NULL || id < 0 || id >= n_vocab || seen[(size_t) id]) {
+            continue;
+        }
+        seen[(size_t) id] = 1;
+        n_first++;
+        // Compare with the PREVIOUS merge-produced id, not with the running maximum: a tokenizer may map an
+        // early merge to a high id (gemma4 maps a few leading-space pieces to 2559xx) and that single peak
+        // would otherwise mark every later id as out of order.  A handful of inverted pairs are tolerated —
+        // they are a rounding error against the ordering, which is what a token-id cutoff needs.
+        if (prev >= 0 && id < prev) {
+            n_out_of_order++;
+        }
+        prev = id;
+    }
+    if (n_first < (size_t) n_vocab / 2 || n_out_of_order > n_first / 100) {
+        why = format("token ids do not follow BPE merge order (%zu of %zu merge-produced tokens out of order)",
+                n_out_of_order, n_first);
+        return false;
+    }
+    return true;
+}
+
+std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, bool shared_target_head) const {
+    const ggml_tensor * out = output;
+    // probe contexts (common_fit_params) use a model with unallocated weights: no subset
+    if (n_keep <= 0 || out == nullptr || out->buffer == nullptr || out->data == nullptr) {
+        return nullptr;
+    }
+    // only the MTP graphs that were taught the subset use it, and only when they score with the model LM head:
+    // qwen35/qwen35moe/qwen4exp (their nextn block or the borrowed target head), and gemma4-assistant, whose
+    // `output` is its own tied token embedding
+    const bool own_head_always = arch == LLM_ARCH_GEMMA4_ASSISTANT;
+    if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP &&
+            arch != LLM_ARCH_GEMMA4 && !own_head_always) {
+        LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
+        return nullptr;
+    }
+    // The nextn checks apply to a model whose own MTP block scores with this head.  They are skipped for a
+    // shared-NextN target (it owns no MTP block, n_layer_nextn == 0, so the layers[n_layer()] access would read
+    // past its layer array; the consumer there is the sidecar's graph, checked against src) and for
+    // gemma4-assistant, whose layer array has exactly n_layer() entries and no nextn sub-struct at all.
+    if (!own_head_always && !shared_target_head && (hparams.n_layer_nextn == 0 ||
+            layers[hparams.n_layer()].nextn.shared_head_head != nullptr)) {
+        LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
+        return nullptr;
+    }
+    const int n_vocab = (int) vocab.n_tokens();
+    if (n_keep >= n_vocab) {
+        return nullptr;
+    }
+
+    const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(out->buffer);
+
+    // the lock covers the build, so that contexts created at the same time with the same n_keep share one subset
+    std::lock_guard<std::mutex> lock(pimpl->mtp_draft_mutex);
+
+    auto & cache = pimpl->mtp_draft_cache;
+    for (auto it = cache.begin(); it != cache.end(); ) {
+        it = it->second.expired() ? cache.erase(it) : std::next(it);
+    }
+    const auto key = std::make_pair(n_keep, buft);
+    if (auto it = cache.find(key); it != cache.end()) {
+        return it->second.lock();
+    }
+
+    std::string why;
+    if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
+        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
+        return nullptr;
+    }
+    std::vector<int64_t> ids;
+    ids.reserve(n_vocab);
+    for (int t = 0; t < n_vocab; ++t) {
+        const int attr = (int) vocab.token_get_attr(t);
+        if (t < n_keep || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+            ids.push_back(t);
+        }
+    }
+    const int64_t n_sel = (int64_t) ids.size();
+    if (n_sel >= out->ne[1]) {
+        return nullptr;
+    }
+    const size_t row_bytes = out->nb[1];
+    std::vector<uint8_t> host((size_t) n_sel * row_bytes);
+    for (size_t j = 0; j < ids.size(); ) {
+        size_t k = j;
+        while (k + 1 < ids.size() && ids[k + 1] == ids[k] + 1) {
+            k++;
+        }
+        ggml_backend_tensor_get(out, host.data() + j * row_bytes, (size_t) ids[j] * row_bytes, (k - j + 1) * row_bytes);
+        j = k + 1;
+    }
+
+    auto res = std::make_shared<llama_mtp_draft_vocab>();
+    res->n_keep = n_keep;
+    res->src    = out;
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    res->ctx.reset(ggml_init(ip));
+    res->head = ggml_new_tensor_2d(res->ctx.get(), out->type, out->ne[0], n_sel);
+    res->ids  = ggml_new_tensor_1d(res->ctx.get(), GGML_TYPE_I64, n_sel);
+    ggml_format_name(res->head, "mtp_draft_head_%d", n_keep);
+    ggml_format_name(res->ids,  "mtp_draft_ids_%d",  n_keep);
+    res->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(res->ctx.get(), buft));
+    if (!res->buf) {
+        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d: buffer allocation failed, drafting over the full vocabulary\n", __func__, n_keep);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(res->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(res->head, host.data(), 0, host.size());
+    ggml_backend_tensor_set(res->ids, ids.data(), 0, ids.size() * sizeof(int64_t));
+
+    LLAMA_LOG_INFO("%s: mtp_draft_vocab = %d: MTP draft head uses %lld of %lld rows (%.2f MiB of %s, %s)\n", __func__, n_keep,
+                   (long long) n_sel, (long long) out->ne[1], (double) (n_sel * row_bytes) / 1048576.0, ggml_type_name(out->type),
+                   ggml_backend_buft_name(buft));
+
+    cache[key] = res;
+    return res;
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -2909,6 +3281,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     }
 
     return layers[il].rope_short;
+}
+
+// The MTP drafter's KV window policy (see llama-ext.h).  `req` is the request: -1 = `auto` (the policy),
+// 0 = off (a full `-c` draft cache), N = N cells per sequence (floored at one batch).
+//
+// `auto` is THE CAP OR NOTHING.  The cap (65536 cells, one draft layer, ~1 GiB of a 27B at `-c 262144`) is where
+// the window stops buying anything: at or above the context the drafter works over it changes no draft, and every
+// cell below it that the window masks is a decode cost -- 7-9 % when the request is deeper than the window.
+// A window that would have to be SMALLER than the cap is therefore declined instead of granted: it saves at
+// most one batch of cells per sequence and guarantees the draft the drafter's oldest cells are gone.  The
+// pre-r246 policy took `n_ctx_seq/4` clamped to [32768, 65536], which at `-c 131072` picked 32768 -- a quarter
+// of the context, i.e. below the depth a 62k request reaches -- and cost 8 % of decode on BOTH builds
+// (issue #293, measured 2026-11-10: 55.14 t/s at a 32768 window against 59.81 with the window off).
+uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, int32_t req) {
+    if (n_ctx_seq == 0 || req == 0) {
+        return 0;
+    }
+
+    // one ubatch must always be placeable (`llama_kv_cache::find_slot` refuses a batch wider than the cache)
+    const uint32_t floor_cells = GGML_PAD(n_ubatch + 256, 256);
+
+    uint32_t w;
+    if (req < 0) {
+        w = std::min<uint32_t>(65536, n_ctx_seq);
+    } else {
+        w = (uint32_t) req;
+    }
+
+    if (w < floor_cells) {
+        w = floor_cells;
+    }
+    // nothing to save: the window would hold the whole cache
+    if (w >= n_ctx_seq) {
+        return 0;
+    }
+
+    return w;
+}
+
+// The cache's cell count for that window (see llama-ext.h).  One function so the cache, the slab's reserve
+// estimate (common/draft-reserve.cpp) and the "is a window active" test cannot disagree about the geometry.
+uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max, bool kv_unified,
+                                   int32_t req, uint32_t * win_out) {
+    GGML_ASSERT(win_out != nullptr);
+    *win_out = 0;
+
+    if (n_ctx_seq == 0) {
+        return 0;
+    }
+
+    const uint32_t win = llama_spec_draft_window_cells(n_ctx_seq, n_ubatch, req);
+    if (win == 0) {
+        return 0;
+    }
+
+    // one whole batch must always be placeable on top of the window (the `iswa` sizing shape)
+    const uint32_t batch = std::max<uint32_t>(1, n_ubatch);
+
+    if (!kv_unified) {
+        // one stream per sequence: each stream already owns `n_ctx_seq` cells and its own `n_swa`
+        *win_out = win;
+        return GGML_PAD(std::min(n_ctx_seq, win + batch), 256);
+    }
+
+    // A unified cache holds every sequence in ONE stream, so the window has to be granted per sequence or the
+    // first sequence to fill it starves the rest (issue #264).  `per_seq` is the most any one sequence can ever
+    // own, and the window may only claim what leaves a batch of room beside it: a window that does not is
+    // declined rather than lowered, because lowering it to `per_seq - batch` saves `batch` cells per sequence
+    // and masks the drafter's newest cells to do it.
+    const uint32_t n_seq   = std::max<uint32_t>(1, n_seq_max);
+    const uint32_t per_seq = n_ctx_seq / n_seq;
+
+    if (win + batch > per_seq) {
+        return 0;
+    }
+
+    *win_out = win;
+
+    return std::min(n_ctx_seq, GGML_PAD((win + batch)*n_seq, 256));
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
@@ -3083,6 +3534,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* n_rs_batch        */ cparams.n_rs_batch,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
@@ -3257,10 +3709,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
+                // its MTP context gets an indexer cache instead of a plain KV cache.
+                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
+                // graph_mtp reads the same env, so the memory type and the graph routing cannot
+                // disagree.
+                static const bool mtp_sparse = [] {
+                    const char * env = getenv("LLAMA_MTP_SPARSE");
+                    return env == nullptr || std::atoi(env) != 0;
+                }();
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && (!mtp_sparse || hparams.indexer_head_size == 0)));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_sparse && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* no_alloc          */ params.no_alloc,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* n_rs_batch        */ cparams.n_rs_batch,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -3275,6 +3768,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            cparams.n_rs_batch,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
@@ -3348,6 +3842,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -3368,11 +3863,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* kv_pool           */ params.kv_pool,
+                            /* kv_pool_cells     */ params.kv_pool_cells);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -3388,10 +3886,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_rs_batch        */ cparams.n_rs_batch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_pool           */ params.kv_pool,
+                            /* kv_pool_cells     */ params.kv_pool_cells);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3471,6 +3972,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // The MTP drafter's KV window (llama-ext.h).  The draft context is created AFTER the
+                        // target, so this is the only place its cell count exists.
+                        //
+                        // A sliding window, backed by a ring: `find_slot` already reclaims a cell whose
+                        // position is more than `n_swa` behind the newest one for its sequence, which IS the
+                        // ring while positions advance, and it evicts the sequence's oldest cells when they
+                        // do not (a multimodal / M-RoPE chunk, issue #297 -- `swa_ring` below).  Both read
+                        // THIS cache's `n_swa`, so the packed mask windows consistently and `hparams` (shared
+                        // with the target) is untouched.  The derived mask stays valid as well -- its
+                        // predicate is `tok_lo <= cell_pos <= tok_hi` over the per-cell POSITION, so a recycled
+                        // cell reports its new position (a position range, not a cell-index range).  Only the
+                        // drafter loses the tokens older than the window, and the target verifies every token
+                        // it proposes.
+                        //
+                        // The window is per SEQUENCE: under `--kv-unified` this cache holds every sequence in
+                        // one stream, so `llama_spec_draft_kv_cells()` multiplies the cell count by
+                        // `n_seq_max` (issue #264 -- a `win + n_ubatch` cache left a second sequence no cell to
+                        // place its batch in, and every request on that slot failed).
+                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
+                        uint32_t mtp_n_swa   = hparams.n_swa;
+                        llama_swa_type mtp_swa_type = hparams.swa_type;
+                        // `n_swa` of a windowed draft cache is a LOSSY bound, not a mask the model depends on,
+                        // so the cache may make it a true ring (evict the sequence's oldest cells) when a
+                        // batch cannot be placed by position alone -- an M-RoPE image chunk puts ~1k tokens
+                        // on one temporal position, and `win + batch` spare cells then run out mid-chunk
+                        // (issue #297).  A model's OWN sliding window never sets this.
+                        bool mtp_ring = false;
+                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            uint32_t win = 0;
+                            const uint32_t cells = llama_spec_draft_kv_cells(cparams.n_ctx_seq, cparams.n_ubatch,
+                                                                             cparams.n_seq_max, cparams.kv_unified,
+                                                                             cparams.spec_draft_kv_window,
+                                                                             &win);
+                            if (cells != 0) {
+                                mtp_kv_size  = cells;
+                                mtp_n_swa    = win;
+                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                mtp_ring     = true;
+                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells per sequence (draft cache %u "
+                                               "of %u cells per stream, n_seq_max %u, %s; --spec-draft-kv-window "
+                                               "%s -- the target still verifies every token)\n",
+                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq, cparams.n_seq_max,
+                                               cparams.kv_unified ? "unified" : "per-sequence streams",
+                                               cparams.spec_draft_kv_window < 0 ? "auto" :
+                                               std::to_string(cparams.spec_draft_kv_window).c_str());
+                            } else if (cparams.spec_draft_kv_window > 0 ||
+                                       (cparams.spec_draft_kv_window < 0 && cparams.n_ctx_seq > 65536)) {
+                                // `auto` (or an explicit size) declined although there was something to save:
+                                // say which, so "no window" is never a silent outcome.  auto declines when the
+                                // cap would not leave a batch of room per sequence -- the window is a VRAM
+                                // saving, never a decode tax (issue #293).  WARN, not INFO: an INFO from the
+                                // library needs `-lv 4` on both tools, and this is a user-visible change (the
+                                // window a previous release granted here is gone)
+                                LLAMA_LOG_WARN("%s: MTP draft KV window: declined for %u cells per stream x %u "
+                                               "sequence(s) (%s) -- the draft cache stays %u cells and no draft "
+                                               "is truncated\n", __func__, cparams.n_ctx_seq, cparams.n_seq_max,
+                                               cparams.spec_draft_kv_window < 0
+                                                   ? "--spec-draft-kv-window auto: 65536 cells would not fit"
+                                                   : "--spec-draft-kv-window N: N would not fit",
+                                               mtp_kv_size);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 params.no_alloc,
@@ -3480,14 +4044,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                mtp_kv_size,
                                 cparams.n_seq_max,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_n_swa,
+                                mtp_swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                "",
+                                false,
+                                true,
+                                false,
+                                -1,
+                                /*.swa_ring    =*/ mtp_ring);
                     }
                 }
             }
@@ -3534,7 +4104,10 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
+        /*.host_experts_limit_gib      =*/ -1,
         /*.main_gpu                    =*/ 0,
+        /*.n_cpu_moe_from_end          =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -3545,6 +4118,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.allow_nextn_cpu_offload     =*/ false,
     };
 
     return result;
@@ -3559,6 +4133,12 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    // r143: the expert cache is process-global and its tables point at THIS model's host expert masters.
+    // Drop them while the model (and so the masters) are still valid -- otherwise a later arena sizing
+    // fills a dead table from freed host memory.
+    if (model != nullptr) {
+        llama_model_moe_cache_forget(model);
+    }
     delete model;
 }
 
@@ -3605,6 +4185,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
         return 0;
     }
     return model->hparams.n_swa;
+}
+
+int32_t llama_model_n_layer_swa(const llama_model * model) {
+    if (model->hparams.n_swa == 0) {
+        return 0;
+    }
+    int32_t n = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        n += model->hparams.is_swa(il) ? 1 : 0;
+    }
+    return n;
 }
 
 
@@ -3991,6 +4582,115 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
+    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
+    const size_t max_host_table = model->max_host_weight_tensor_bytes();
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes, max_host_table);
+        }
+    }
+}
+
+void llama_model_moe_cache_forget(const llama_model * model) {
+    if (model == nullptr) {
+        return;
+    }
+    // Walk the HOST-EXPERT map (the real devices that own the masters), exactly like the preflight: under
+    // `-sm tensor` `model->devices` holds the Meta device, which owns no host-expert table.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_forget(kv.first);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int llama_model_moe_cache_band(const llama_model * model) {
+    if (model == nullptr) {
+        return 0;
+    }
+    // TODO #59: the band is a per-device kernel property, so answer with the SMALLEST band across the
+    // model's host-expert devices: a verify batch is replicated over every device of a tensor split, so
+    // the narrowest band is the one that decides whether the batch is served from the arena.
+    //
+    // TODO #117: ONLY a device that actually carries host-resident experts has a band.  This used to fall
+    // back to `model->devices`, and with `moe_cache_enabled()` true by default (AUTO) that answered 16 for
+    // a DENSE model on every non-Meta device list -- a single GPU, or any `-sm layer` run -- where no
+    // routed expert exists anywhere and there is nothing to respect: `common`'s n-gram clamp then cut a
+    // 64-token draft to 15, and the MTP/DFlash2 multi-slot alignment bounded every slot to
+    // `band / n_drafting - 1` rows (measured -7.5 % wall on a dense 3-slot DFlash2 arm).  The fallback also
+    // contradicted this function's documented contract.  `moe_host_expert_bytes` is the host-resident
+    // expert account the loader fills (r97: a pageable CPU-only placement is deliberately not accounted),
+    // so it is empty exactly when no routed expert is streamed from a host master.  Keep the
+    // `moe_cache_enabled()` gate the device hook applies -- a slab-declined or arena-released host-expert
+    // config reports 0 (TODO #96) -- and do NOT test `moe_cache_has_tables()` here: tables register during
+    // the first compute, after `llama_init_from_model`, which is exactly the r129 bug.
+    int band = 0;
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        const int b = ggml_backend_dev_moe_cache_band(kv.first);
+        if (b > 0 && (band == 0 || b < band)) {
+            band = b;
+        }
+    }
+    return band;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+}
+
+int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
+    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
+}
+
+bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                     ggml_backend_dev_t * dev, size_t * bytes) {
+    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
+        return false;
+    }
+    auto it = model->moe_host_expert_bytes.begin();
+    std::advance(it, i);
+    if (dev   != nullptr) { *dev   = it->first;  }
+    if (bytes != nullptr) { *bytes = it->second; }
+    return true;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
@@ -4020,7 +4720,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_SKIP_MANAGED   (llama_model_loader::TENSOR_SKIP_MANAGED) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
@@ -4147,6 +4848,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
     }
 }
 
+void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n) {
+    if (n == 0) {
+        model->embeddings_layer_inp_preset.clear();
+    } else {
+        model->embeddings_layer_inp_preset.assign(lids, lids + n);
+    }
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;
@@ -4188,3 +4897,4 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
 
     return n_tokens * (uint32_t) tensor->ne[0];
 }
+
