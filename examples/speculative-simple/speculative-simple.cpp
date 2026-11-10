@@ -44,7 +44,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx_tgt = NULL;
 
     // load the target model
-    auto llama_init_tgt = common_init_from_params(params);
+    auto llama_init_tgt = common_init_from_params(params, /*model_only =*/ false, /*preload_draft =*/ true);
 
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
@@ -57,7 +57,7 @@ int main(int argc, char ** argv) {
     {
         common_params params_dft = common_base_params_to_speculative(params);
 
-        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt, llama_init_tgt->take_draft_model());
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();
@@ -265,6 +265,10 @@ int main(int argc, char ** argv) {
         // and make the accepted tokens the new partial draft for the next iteration
         if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
+
+            // the accepted tokens are replayed next round without a new draft() call;
+            // report the partial result now so speculators do not get stale feedback
+            common_speculative_accept_partial(spec, seq_id, ids.size() - 1);
 
             draft = std::move(ids);
 
