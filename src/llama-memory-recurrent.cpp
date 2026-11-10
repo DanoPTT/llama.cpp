@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -26,6 +28,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -33,7 +36,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     size = mem_size;
     used = 0;
 
-    this->n_rs_seq = n_rs_seq;
+    this->n_rs_seq   = n_rs_seq;
+    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -124,7 +128,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     if (is_empty()) {
         if (n_rs_seq > 0) {
-            n_rs_seq = 0;
+            this->n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
     }
@@ -135,7 +139,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_p = size_p_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, this->n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
@@ -161,6 +165,13 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+}
+
+// LLAMA_RS_ROLLBACK_DEBUG=1: instrumentation for the recurrent rollback boundary (the RSMTP lines below).  Read
+// ONCE: seq_rm() and prepare() run on every speculative step, and getenv() is slow on Windows (issue #273).
+static bool rs_rollback_debug() {
+    static const bool debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
+    return debug;
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -509,10 +520,45 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
 
+    // `LLAMA_RS_ROLLBACK_DEBUG=1`: one line per prepared ubatch, so a log shows the prepare order that
+    // leads into a rollback.  The rollback bound itself is upstream's (see seq_rm(), rs_max); this is the
+    // instrument that showed a large batch can precede a small sequence's rollback in one prepare list.
+    if (!ubatches.empty()) {
+        const bool rs_debug = rs_rollback_debug();
+        if (rs_debug) {
+            for (size_t u = 0; u < ubatches.size(); ++u) {
+                const llama_ubatch & ub = ubatches[u];
+                char ids[128] = {0};
+                size_t o = 0;
+                for (uint32_t s = 0; s < ub.n_seqs_unq && o + 12 < sizeof(ids); ++s) {
+                    o += (size_t) snprintf(ids + o, sizeof(ids) - o, "%s%d", s ? "," : "", (int) ub.seq_id_unq[s]);
+                }
+                const llama_pos p_first = (ub.n_tokens > 0 && ub.pos) ? ub.pos[0] : -1;
+                const llama_pos p_last  = (ub.n_tokens > 0 && ub.pos) ? ub.pos[ub.n_tokens - 1] : -1;
+                const llama_pos p_1     = (ub.n_tokens > 1 && ub.pos) ? ub.pos[1] : -1;
+                LLAMA_LOG_WARN("%s: RSPREP prep=%zu/%zu n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u "
+                               "n_pos=%u pos=[%d..%d] pos0=%d pos1=%d seq_ids=[%s]\n",
+                               __func__, u + 1, ubatches.size(), ub.n_tokens, ub.n_seq_tokens, ub.n_seqs,
+                               ub.n_seqs_unq, ub.n_pos, (int) p_first, (int) p_last, (int) p_first, (int) p_1, ids);
+            }
+        }
+    }
+
     return success;
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    // A qwen4exp MTP context carries a hybrid-idx memory whose recurrent filter matches nothing
+    // (the nextn layer is not recurrent), so its cells are never read back - the graph only gives
+    // the unused recurrent inputs a trivial use, and llama_memory_hybrid_idx skips the recurrent
+    // in seq_rm/state.  The bookkeeping below still runs (the graph input sizes need `n`), but the
+    // speculative verify positions must not spam the non-consecutive-position warning.
+    const bool has_recr = [&] {
+        for (ggml_tensor * t : r_l) { if (t) { return true; } }
+        for (ggml_tensor * t : s_l) { if (t) { return true; } }
+        return false;
+    }();
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -646,6 +692,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // the rollback bound belongs to the state, not to the cell index: a moved cell keeps the
+            // snapshots of the state that lived there (r195 moves planes 1..n_rs_seq by index), so the
+            // bound has to travel with pos/src/seq_id or a rollback after a move reads the wrong limit
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -666,7 +716,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (has_recr && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
@@ -736,12 +786,12 @@ bool llama_memory_recurrent::is_empty() const {
 }
 
 size_t llama_memory_recurrent::total_size() const {
-    size_t size = 0;
+    size_t size_l = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+        size_l += ggml_backend_buffer_get_size(buf.get());
     }
 
-    return size;
+    return size_l;
 }
 
 size_t llama_memory_recurrent::size_r_bytes() const {
@@ -903,8 +953,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
             io.write(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id) {
-                for (auto seq_id : cell.seq_id) {
-                    io.write(&seq_id, sizeof(seq_id));
+                for (auto seq_id_i : cell.seq_id) {
+                    io.write(&seq_id_i, sizeof(seq_id_i));
                 }
             }
         }
@@ -1358,6 +1408,14 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
+int32_t llama_memory_recurrent_context::s_src(int i) const {
+    return mem->cells[i + mem->head].src0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
