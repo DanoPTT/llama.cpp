@@ -10,14 +10,1086 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
 #include <unordered_set>
 
+// wip/host-expert-dio-cache Phase 1 (plumbing, inert): the host-expert on-disk source registry and the
+// host-pool enable live in ggml-cuda.  They are routed through the device API (issue #130) instead of a
+// direct forward declaration, because libllama must not reference a ggml-cuda symbol on a backend-DL
+// build (and a Windows DLL only exports what is marked GGML_API).  Both calls are no-ops unless the host
+// pool is requested, and are served by whichever device provides the callback.
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+// place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+// `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
+        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
+                       "by a no-XNACK GPU, issue #116); using pinned instead\n", func);
+    }
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
+        // issue #130: route through the device API (the pool is global in ggml-cuda, so any device serves;
+        // a backend without the callback is a no-op).
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+        }
+        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+                       "mapping and every GPU read is served through a bounded pinned pool "
+                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes capped "
+                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
+                       func);
+    }
+}
+
+// wip/host-expert-master-drop (TODO #55): POOL mode drops the FULL PINNED host expert master.  The
+// tensors are placed in the read-only model mapping (page cache / GGUF on disk) instead, and every GPU
+// read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
+// becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
+// not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
+ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
+    // wip/host-expert-tier: with a `-lme` plan the decision is per TENSOR.  A hole keeps the read-only model
+    // mapping (pageable, served through the bounded pool or the per-table bounce ring); everything else gets
+    // the pinned master, which for a table IS the region: expert `e` lives at `base + e * host_bytes`, so a
+    // fully pinned tensor is byte-for-byte today's `pinned` master and keeps the single-launch staging
+    // branch, the in-place cold read and the UVA alias.
+    const bool want_mapping = host_experts_plan_done ? host_expert_is_hole(name)
+                                                     : host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL;
+    if (want_mapping && use_mmap && !pin_master) {
+        ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(dev);
+        if (master != nullptr) {
+            return master;
+        }
+    }
+    return ggml_backend_dev_host_buffer_type(dev);
+}
+
+// ---------------------------------------------------------------------------------------------
+// wip/host-expert-tier: the `-lme, --limit-host-experts` budget, spent on WHOLE host-expert tensors
+// in descending hotness order.  See `plan_host_expert_placement` in the header for the policy.
+//
+// Why per tensor and not per expert: a pinned master is addressed by expert index (stride `nb[2]`), so a
+// partial one would need holes inside the region and a changed cold-read encoding (the `id - n_res_slots`
+// -> slot encoding is shared with the KV/arena paths).  Whole tensors keep the geometry, so a pinned tensor
+// is byte-for-byte today's `pinned` master and its table keeps the single-launch staging branch and the
+// in-place cold read.  Per-expert residency inside a table remains the pool's job (the fallback below).
+// ---------------------------------------------------------------------------------------------
+
+// MemAvailable, not MemFree: the pinned tier is allowed to sit on reclaimable page cache, and the kernel
+// hands page cache over on demand.  Falls back to the CPU device's free memory on a platform without
+// /proc/meminfo.  Returns 0 when nothing can be measured (the caller then refuses to guess).
+static size_t host_experts_available_bytes() {
+    size_t out = 0;
+#if !defined(_WIN32)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            long long kib = -1;
+            if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1 && kib > 0) {
+                out = (size_t) kib * 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
+#endif
+    if (out == 0) {
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        size_t total = 0;
+        if (cpu != nullptr) {
+            ggml_backend_dev_memory(cpu, &out, &total);
+        }
+    }
+    return out;
+}
+
+// `blk.12.ffn_gate_exps.weight` -> 12, or -1.
+static int host_expert_layer_of(const std::string & name) {
+    int layer = -1;
+    if (sscanf(name.c_str(), "blk.%d.", &layer) != 1) {
+        return -1;
+    }
+    return layer;
+}
+
+// The placement the loader will actually make for `name` on layer `layer`: the `-ncmoe` tail rule, or an
+// explicit caller pattern (`--cpu-moe`, `--override-tensor exps=CPU`, `-ncmoe` in the forward placement).
+// Mirrors the `create_tensor` override logic, minus the exclusions that can only make it MORE conservative
+// (an excluded tensor that this says is hosted simply keeps the pageable master).
+void llama_model_loader::set_host_experts_umem(bool on) {
+    if (!on || host_experts_umem) {
+        return;
+    }
+    host_experts_umem = true;
+    // One message, and only when something actually asked for host experts: the placement is
+    // deliberately NOT a silent clamp, because on a shared pool the user's `-ncmoe N` is refused rather
+    // than half-honoured, and the run then uses the device's own memory (the whole pool).
+    if (n_cpu_moe_from_end > 0 || tensor_buft_overrides != nullptr) {
+        // wip/apu-expert-gtt P2: `-lme` is NOT ignored on such a device any more -- it is the size of the
+        // registered GTT expert store.  `MOE_EXPERT_GTT=0` prints the pre-P2 sentence instead, byte for byte.
+        static const bool gtt_on = [] {
+            const char * e = getenv("MOE_EXPERT_GTT");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (gtt_on) {
+            LLAMA_LOG_WARN("%s: this device's memory is a SHARED host/device pool (an integrated GPU), so "
+                           "host-resident MoE experts are refused: the weights and host RAM are one pool, and the "
+                           "expert staging tier is not available there (it would read a page the GPU cannot "
+                           "address).  All expert weights stay on their layer's device; `-ncmoe`/`-cmoe` and "
+                           "a CPU `--override-tensor` for `*_exps.*` are ignored on such a device.  `-lme` is "
+                           "not: it sizes the registered GTT EXPERT STORE (registered host memory the GPU reads "
+                           "in place, spent on the hottest expert tables), and MOE_EXPERT_GTT=0 disables it.\n",
+                           __func__);
+        } else {
+            LLAMA_LOG_WARN("%s: this device's memory is a SHARED host/device pool (an integrated GPU), so "
+                           "host-resident MoE experts are refused: the weights and host RAM are one pool, and the "
+                           "expert staging tier is not available there (it would read a page the GPU cannot "
+                           "address).  All expert weights stay on their layer's device; `-ncmoe`/`-cmoe`/`-lme` and "
+                           "a CPU `--override-tensor` for `*_exps.*` are ignored on such a device.\n", __func__);
+        }
+    }
+    // drop the placement outright, so no `blk.<i>` tail patterns are even built
+    n_cpu_moe_from_end = 0;
+}
+
+bool llama_model_loader::host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const {
+    if (host_experts_umem) {
+        return false;   // a shared host/device pool: nothing is hosted (see set_host_experts_umem)
+    }
+    if (layer < 0) {
+        return false;
+    }
+    if (n_cpu_moe_from_end > 0) {
+        return layer >= n_layer_trunk - n_cpu_moe_from_end && layer < n_layer_trunk;
+    }
+    if (tensor_buft_overrides == nullptr) {
+        return false;
+    }
+    std::string tensor_name = name;
+    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
+        if (o->buft != ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        std::regex pattern(o->pattern);
+        if (std::regex_search(tensor_name, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+    if (host_experts_plan_done) {
+        return;
+    }
+    host_experts_plan_done = true;
+
+    if (host_experts_umem) {
+        // A shared host/device pool: no host-expert tier at all (see set_host_experts_umem).  The expert
+        // residency knob on such a device is `-lme`, which sizes the registered GTT expert store instead.
+        plan_gtt_expert_store(n_layer_trunk);
+        host_experts_plan_done = false;
+        return;
+    }
+
+    // --- 1. the candidate set and its byte total ------------------------------------------------
+    // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
+    // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
+    // the order the arch happens to visit them in.
+    struct cand_t {
+        std::string name;
+        int         layer = -1;
+        int         n_experts = 0;
+        size_t      host_bytes = 0;
+        size_t      nbytes = 0;
+        int64_t     score = 0;
+    };
+    std::vector<cand_t> cands;
+    size_t total = 0;
+    for (const auto & kv : weights_map) {
+        const std::string & name = kv.first;
+        if (name.find("exps") == std::string::npos) {
+            continue;
+        }
+        const ggml_tensor * t = kv.second.tensor;
+        if (t == nullptr || t->ne[2] < 2) {
+            continue;   // an expert bank only: a `scale`/`bias` side vector has ne[2] == 1
+        }
+        const int layer = host_expert_layer_of(name);
+        if (!host_expert_selected(name, layer, n_layer_trunk)) {
+            continue;
+        }
+        cand_t c;
+        c.name       = name;
+        c.layer      = layer;
+        c.n_experts  = (int) t->ne[2];
+        c.host_bytes = (size_t) t->nb[2];
+        c.nbytes     = ggml_nbytes(t);
+        total += c.nbytes;
+        cands.push_back(std::move(c));
+    }
+    host_experts_total_bytes = total;
+    if (cands.empty()) {
+        // Nothing is hosted (`-ncmoe 0`), or the placement is not one this pre-pass can see: keep the
+        // historical, mode-keyed decision tensor by tensor.
+        host_experts_plan_done = false;
+        host_experts_policy    = "no host expert tensors to place";
+        return;
+    }
+
+    // --- 2. the budget --------------------------------------------------------------------------
+    const size_t avail = host_experts_available_bytes();
+    // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
+    // separate knob from MOE_HOST_POOL_FRAC, which is a percentage of the host EXPERT BYTES (the pool's
+    // size); the two answer different questions and must not share a variable.
+    int frac = 80;
+    if (const char * e = getenv("MOE_HOST_LIMIT_FRAC")) {
+        const int v = atoi(e);
+        if (v > 0 && v <= 100) {
+            frac = v;
+        }
+    }
+    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
+    size_t cap = 0;
+    // `-lme N` with N below the host expert set spends the budget PER EXPERT (the pool), not per tensor: a
+    // whole-tensor pinned master is the wrong shape for a partial budget, because MoE routing is spread across
+    // every layer, so no single tensor is hot (measured: 8 064 MiB of pinned whole tensors = 505 prefill / 50
+    // decode against 713 / 57 for a 9 331 MiB pool at 2 devices, and the pool reads its residents in place
+    // since MOE_HOST_POOL_COLD_MULTIDEV).  At or above the set it is the fit case, where a pinned master wins
+    // decode outright (1105 / 72).
+    auto put = [](size_t b) { return (double) b / (1024.0 * 1024.0); };
+    char policy[512];
+    // The tier for a partial budget.  Default: per EXPERT (the pool) below 90 % of the host expert set, whole
+    // TENSORS at or above it.  Measured anchors (2 devices, 35B-A3B, see `wip/host-expert-eager-push/
+    // P5-RESULTS.md` §7): at 86 % of the bytes the two shapes tie on decode (65.6 pool against 65.7 tensors)
+    // while the pool is far better prefill; at 100 % the whole-tensor tier wins decode outright (71.9 against
+    // 63.9), because only a pinned *master* gets the single-launch staging branch and the native fill.  The
+    // exact crossover was not swept -- `MOE_HOST_TIER=pool|tensor` forces either shape, which is the A/B arm.
+    // wip/host-expert-pool-surplus: the POOL is the mechanism at every budget.  Its per-tensor slot count comes
+    // from the budget, and the pool lays itself out as "the complement of the arena first, then the hottest
+    // arena-resident experts while capacity remains" -- so a budget that only covers the complement stays a
+    // bounded complement, and a budget that covers the whole set turns it into a mirror (i.e. `pinned`'s memory
+    // and transport, measured 19 % better prefill than a pinned master and within 0.4-3 % on decode).  The
+    // whole-tensor pinned-master tier is therefore only the explicit `--host-experts pinned` / MOE_HOST_TIER=tensor
+    // escape hatch.
+    const char * tier_env = getenv("MOE_HOST_TIER");
+    const bool force_tensor = tier_env != nullptr && strcmp(tier_env, "tensor") == 0;
+    const bool pinned_masters = force_tensor || host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED;
+    if (!pinned_masters) {
+        for (const auto & c : cands) {
+            host_experts_holes.insert(c.name);
+        }
+        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
+        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
+        const size_t budget = host_experts_limit_gib > 0
+                            ? (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull
+                            : (total <= auto_cap ? total
+                                                 : (auto_cap > 0 ? auto_cap : total));
+        host_experts_cap_bytes = budget;
+        if (use_mmap) {
+            host_experts_pool_holes = true;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                // r273: only `-lme N` is the operator's own number.  `auto`'s resolution is DERIVED (it
+                // applied MOE_HOST_LIMIT_FRAC here, but the pool's own ceiling still gets to speak for it),
+                // and an explicit N is honoured in full.
+                ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget, host_experts_limit_gib > 0);
+                ggml_backend_dev_moe_cache_set_host_pool(d, true);
+            }
+        }
+        // THE REQUEST, not the layout.  The loader runs before a single pool exists, so it cannot know what
+        // the pool will end up holding -- a derived budget is still subject to MOE_HOST_POOL_RAM_PCT when the
+        // first table is built.  Claiming "a MIRROR" here was a claim about the future that the pool then
+        // contradicted (field case: `-lme 70` against a 54 750 MiB set on a 91 GiB box printed MIRROR and
+        // realised 95.3 %).  The pool prints the RESOLVED layout once, at WARN, when the first table is built.
+        const char * how = budget >= total
+                             ? "the whole host expert set -- a mirror IF the pool can hold it (the pool reports "
+                               "its RESOLVED coverage when it is built)"
+                             : "the arena's complement, plus mirrored residents while capacity lasts";
+        if (host_experts_limit_gib > 0) {
+            snprintf(policy, sizeof(policy),
+                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
+                     "prior (the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
+                     put(budget), put(total), how, use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+        } else {
+            snprintf(policy, sizeof(policy),
+                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
+                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+        }
+        host_experts_policy = policy;
+        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+        return;
+    }
+    if (host_experts_limit_gib > 0) {
+        cap = (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull;
+        snprintf(policy, sizeof(policy),
+                 "-lme %lld -> budget %.1f MiB covers the whole host expert set, so it is spent on whole tensors "
+                 "in descending hotness (the fit case: a pinned master is the fastest decode transport)",
+                 (long long) host_experts_limit_gib, put(cap));
+    } else if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED) {
+        cap = SIZE_MAX;
+        snprintf(policy, sizeof(policy), "host_experts_mode=PINNED -> the whole host expert set");
+    } else if (avail == 0) {
+        cap = SIZE_MAX;
+        snprintf(policy, sizeof(policy), "auto: MemAvailable unknown -> the whole host expert set");
+    } else if (total <= auto_cap) {
+        cap = total;
+        snprintf(policy, sizeof(policy),
+                 "auto: the host expert set (%.1f MiB) fits %d%% of MemAvailable (%.1f MiB) -> pin all of it",
+                 put(total), frac, put(auto_cap));
+    } else {
+        cap = 0;
+        snprintf(policy, sizeof(policy),
+                 "auto: the host expert set (%.1f MiB) does NOT fit %d%% of MemAvailable (%.1f MiB) -> no pinned "
+                 "master; every host expert stays in the model mapping and the bounded pinned pool serves the "
+                 "reads (size it with MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC)",
+                 put(total), frac, put(auto_cap));
+    }
+    host_experts_policy = policy;
+
+    if (cap == 0) {
+        // The not-fitting band: today's pool-backed master (pageable), which is the mode the pool exists for.
+        // EVERY candidate is a hole -- without this the per-tensor decision would fall through to the pinned
+        // default and pin the whole set, which is exactly what this branch exists to avoid.
+        for (const auto & c : cands) {
+            host_experts_holes.insert(c.name);
+        }
+        if (use_mmap) {
+            host_experts_pool_holes = true;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+            }
+        }
+        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+        return;
+    }
+
+    // --- 3. rank by the persisted heat prior, then take what fits --------------------------------
+    ggml_backend_dev_t heat_dev = nullptr;
+    if (!files.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
+                if (heat_dev == nullptr) {
+                    heat_dev = d;
+                }
+            }
+        }
+    }
+    if (heat_dev != nullptr) {
+        for (auto & c : cands) {
+            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts, c.host_bytes);
+            if (s >= 0) {
+                c.score = s;
+                host_experts_heat_seen = true;
+            }
+        }
+    }
+    if (host_experts_heat_seen) {
+        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
+            return a.score > b.score;
+        });
+    }
+
+    size_t planned = 0;
+    size_t n_pinned = 0;
+    for (const auto & c : cands) {
+        if (planned + c.nbytes > cap) {
+            host_experts_holes.insert(c.name);   // stays in the model mapping; a smaller one below may still fit
+            continue;
+        }
+        host_experts_pinned.insert(c.name);
+        planned += c.nbytes;
+        ++n_pinned;
+    }
+    host_experts_cap_bytes = cap;
+
+    // Holes keep the read-only model mapping and are served either by the bounded pinned pool or, when the
+    // budget is spent, by the per-table bounce ring (the page cache as the source).  The pool is only given
+    // what the budget has left, so `-lme` stays a cap on the whole non-swappable tier rather than a floor.
+    // An explicit `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still forces it on -- that is the A/B arm for
+    // "the same budget spent per EXPERT (the pool) instead of per TENSOR (a pinned master)".
+    if (!host_experts_holes.empty() && use_mmap) {
+        // The spare is normally smaller than one host expert tensor (a whole tensor is 90-176 MiB, and the
+        // budget buys whole tensors), so it cannot fund a useful pool -- and a pool that fits a small fraction
+        // of the holes buys nothing (measured: a 512 MiB or 1 GiB pool is indistinguishable from none).  The
+        // holes therefore read the page cache directly through the per-table bounce ring.  An explicit
+        // `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still turns the pool on, which is the A/B arm for "the
+        // same RAM spent per EXPERT (a pool) instead of per TENSOR (a pinned master)".
+        host_experts_pool_holes = getenv("MOE_HOST_POOL") != nullptr || getenv("MOE_HOST_POOL_MIB") != nullptr;
+        if (host_experts_pool_holes) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+            }
+        }
+    }
+
+    snprintf(policy, sizeof(policy),
+             "%.1f of %.1f MiB pinned (%zu of %zu tensors, %s); %.1f MiB pageable%s",
+             put(planned), put(total), n_pinned, cands.size(),
+             host_experts_heat_seen ? "descending hotness" : "model tensor order (no heat prior)",
+             put(total - planned),
+             host_experts_pool_holes ? " via the bounded pinned pool" : " (per-table bounce ring)");
+    host_experts_policy += ": ";
+    host_experts_policy += policy;
+    LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+}
+
+// ---------------------------------------------------------------------------------------------
+// wip/apu-expert-gtt P2: the `-lme` budget on a UMA device is the SIZE OF THE REGISTERED GTT EXPERT STORE.
+//
+// `-lme` (`--limit-host-experts`) already means "cap the NON-SWAPPABLE memory used by host-resident MoE
+// experts, N GiB, spent in descending hotness from the persisted heat map" on a discrete box.  On an APU
+// there is no host tier (`-ncmoe`/`-cmoe` are refused there, r236), so the same flag is the only expert
+// residency knob and it has to engage the GTT store by itself -- same units, same ranking, same ceiling, and no
+// new sizing variable (IMPLEMENTATION.md P1.1, README.md §5).
+//
+// The granularity differs and that is deliberate: a whole expert tensor per decision here, because the GTT store
+// is a PLACEMENT, not a cache.  Per-(tensor, expert) slots are what the GTT store is sliced into (an expert's rows
+// are contiguous, `nb[2]` per expert), but deciding which SLOT is resident is the eviction policy's job (P3),
+// and there is no eviction this phase.  So: the hottest whole tables that fit are resident, everything else
+// keeps its layer's device buffer, and the census says so out loud rather than implying a streaming tier.
+void llama_model_loader::plan_gtt_expert_store(int n_layer_trunk) {
+    // Today's state and today's message, so `MOE_EXPERT_GTT=0` reproduces the log byte for byte.
+    host_experts_policy = "shared host/device memory pool (integrated GPU): no host expert tensors";
+
+    // A `--fit` / `--no-alloc` PROBE load places no weights at all (dummy buffers), so it must not reserve and
+    // register the GTT store either: that would make the fit pass commit the very memory it is trying to measure,
+    // and on a fitting model it would be the whole expert set.  The real load plans and reserves it.
+    if (no_alloc) {
+        return;
+    }
+
+    // `-lme` IS THE OPT-IN (maintainer decision, 2026-11-11): *"-lme turns on the arena, to allow for the
+    // possibility to stream models that don't fit from disk for the portions that don't fit in the GTT store."*
+    // `host_experts_limit_gib` is -1 when the flag was never given (`0` = `-lme auto`, `>0` = N GiB), so this is
+    // the difference between "the operator asked for an expert residency budget" and "nobody did".  Without it:
+    //   * the store is still sized from MemAvailable and PLACEMENT may engage (a fitting model keeps its hot
+    //     subset registered -- measured neutral-to-positive, and it is the delivery's default-on behaviour);
+    //   * but the ARENA never engages, and therefore nothing may be streamed: a model whose weights do not fit in
+    //     RAM is REFUSED with the fix (pass `-lme`) instead of being made to run by a tier the operator did not
+    //     ask for.  That is the `gtt_store_can_stream` flag below, and it is what keeps the arena an explicit
+    //     contract rather than something a load silently falls into.
+    const bool lme_given = host_experts_limit_gib >= 0;
+
+    // --- 1. the candidate set: every resident expert bank ------------------------------------------
+    // Unlike the discrete arm there is no `-ncmoe` selection to honour (it is refused on this device), so the
+    // candidates are all of the model's expert banks.  `ne[2] >= 2` filters a `scale`/`bias` side vector.
+    struct cand_t {
+        std::string name;
+        int         layer        = -1;
+        int         n_experts    = 0;
+        size_t      expert_bytes = 0;
+        size_t      nbytes       = 0;
+        int64_t     score        = 0;
+    };
+    std::vector<cand_t> cands;        // the TRUNK (what `-lme`'s budget buys)
+    std::vector<cand_t> head_cands;   // the MTP/nextn HEAD (pinned, outside that budget -- see below)
+    size_t total = 0;
+    size_t padded_total = 0;
+    size_t head_padded  = 0;
+    for (const auto & kv : weights_map) {
+        const std::string & name = kv.first;
+        if (name.find("exps") == std::string::npos) {
+            continue;
+        }
+        const ggml_tensor * t = kv.second.tensor;
+        if (t == nullptr || t->ne[2] < 2) {
+            continue;
+        }
+        cand_t c;
+        c.name         = name;
+        c.layer        = host_expert_layer_of(name);
+        c.n_experts    = (int) t->ne[2];
+        c.expert_bytes = (size_t) t->nb[2];   // one (tensor, expert) slot -- the heat prior's own unit
+        c.nbytes       = ggml_nbytes(t);
+        // The GTT store's alignment is one page per tensor (the buffer type's contract) and the region's extent is
+        // what gets registered, so the budget is spent on PADDED sizes.  The +4 KiB covers the buffer type's
+        // own `get_alloc_size` (a quantized tensor reserves one padded row past its end, which the GTT store must
+        // keep -- see that function); it is an over-estimate of at most 4 KiB per table, so the extent is safe
+        // by construction and the arithmetic below can never hand the buffer type more than the region holds.
+        // wip/apu-expert-gtt P3c: an MTP/nextn head sits at `layers[n_layer()]` and above, so its expert tables
+        // are the candidates whose layer index is NOT part of the trunk.  They are PINNED (maintainer decision,
+        // 2026-11-11): the head is metadata overhead read on every draft step, so `-lme N` does not get to trade
+        // it away, and its bytes sit on top of that budget rather than inside it.
+        if (n_layer_trunk > 0 && c.layer >= n_layer_trunk) {
+            // `load_mtp` false = the nextn/MTP layers are NOT created for this load, so their tables are not
+            // part of the expert set at all -- counting them would spend store (and a GGUF read) on tensors no
+            // graph will ever touch.  This is also what makes the "whole set" carve the trunk's own set.
+            if (load_mtp) {
+                total       += c.nbytes;
+                head_padded += GGML_PAD(c.nbytes + 4096, 4096);
+                head_cands.push_back(std::move(c));
+            }
+            continue;
+        }
+        total        += c.nbytes;
+        padded_total += GGML_PAD(c.nbytes + 4096, 4096);
+        cands.push_back(std::move(c));
+    }
+    // A model whose expert tables are ALL head (a standalone MTP drafter loaded as the target, or a trunk with
+    // no routed experts) has nothing to pin them against: keep today's uniform arithmetic rather than treating
+    // the whole expert set as overhead (`-lme` would then stop being a cap at all).
+    if (cands.empty()) {
+        cands = std::move(head_cands);
+        head_cands.clear();
+        padded_total = head_padded;
+        head_padded  = 0;
+    }
+    host_experts_store_head_bytes = head_padded;
+    if (cands.empty()) {
+        return;
+    }
+
+    // The arena needs at least ONE slot per expert table: a table the store cannot hold a slot for would have to be
+    // served from the pageable model mapping, which is a fatal GPU fault on this hardware (no XNANCH, no
+    // page-fault retry), not a slow path.  Computed once here because both the lock policy (a clamp that cannot
+    // fund this is not a streaming tier) and the shape decision below need it.
+    size_t arena_min = 0;
+    for (const auto & c : cands) {
+        arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
+    }
+    for (const auto & c : head_cands) {
+        arena_min += GGML_PAD(c.expert_bytes + 512, 4096);
+    }
+
+    // --- 2. the budget: `-lme N`, or `auto` = MOE_HOST_LIMIT_FRAC of MemAvailable --------------------
+    const size_t avail = host_experts_available_bytes();
+    int frac = 80;
+    if (const char * e = getenv("MOE_HOST_LIMIT_FRAC")) {
+        const int v = atoi(e);
+        if (v > 0 && v <= 100) {
+            frac = v;
+        }
+    }
+    const double mib = 1024.0 * 1024.0;
+    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
+    size_t      budget    = 0;
+    std::string source;
+    if (host_experts_limit_gib > 0) {
+        budget = (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull;
+        source = format("-lme %lld", (long long) host_experts_limit_gib);
+    } else if (auto_cap > 0) {
+        budget = auto_cap;
+        source = format("auto: %d%% of MemAvailable -> a %.1f MiB cap", frac, (double) auto_cap / mib);
+    } else {
+        budget = padded_total;
+        source = "auto: MemAvailable unknown -> the whole expert set";
+    }
+    // P3c: the head's bytes never come out of the budget -- they are added to the extent below.
+    if (head_padded > 0) {
+        source += format(" (+ the %.1f MiB MTP/nextn head, pinned outside it)", (double) head_padded / mib);
+    }
+    // The GTT store is registered, RESERVED host memory, so two ceilings apply, both read once:
+    //   1. the machine's own memory -- `-lme N` above 90%% of it is already refused by the arg parser, and this is
+    //      the same rule applied to the `auto` arm and to a host whose memory changed since the parse;
+    //   2. RLIMIT_MEMLOCK, because `cudaHostRegister` alone does NOT pin an `mmap` region (probe 16,
+    //      MEASUREMENTS.md §15): without `mlock` the kernel splits its huge pages and swaps 0-436 MiB per 2 GiB
+    //      out under pressure, and the next GPU read pays a one-off 12-37x stall for the driver's re-fault.
+    //      `MOE_EXPERT_GTT_MLOCK=0` turns locking off, and the backend then reports SIZE_MAX so this policy is
+    //      exactly what it was before locking existed.
+    if (avail > 0 && budget > avail / 10 * 9) {
+        budget = avail / 10 * 9;
+        source += format(", clamped to 90%% of MemAvailable (%.1f MiB)", (double) budget / mib);
+    }
+
+    // The weights' own footprint, the ceiling they may occupy, and the SHAPE decision that follows from it.  All
+    // three are computed once here because the LOCK policy below reasons about the same numbers: a model whose
+    // weights exceed 90 % of MemAvailable has a shortfall that must live somewhere else, and on an APU the only
+    // thing below RAM is the page cache.
+    size_t weights_total = 0;
+    for (const auto & kv : weights_map) {
+        if (kv.second.tensor != nullptr) {
+            weights_total += ggml_nbytes(kv.second.tensor);
+        }
+    }
+    const size_t fit_cap_now = avail > 0 ? avail - avail / 10 : 0;
+    const char * arena_env   = getenv("MOE_EXPERT_GTT_ARENA");
+    // Tri-state (maintainer decision, 2026-11-11): unset = the SHAPE FOLLOWS THE BUDGET, `=1` forces the arena,
+    // `=0` forces placement.  A fixed A/B arm must pin it -- the default depends on the model and on `-lme`.
+    const bool   arena_wanted = arena_env != nullptr ? atoi(arena_env) != 0 : true;
+
+    // --- 2b. the lock: a clamp when it is an optimisation, a refusal when it is the difference between
+    //         running and not running ----------------------------------------------------------------
+    // Only an integrated device can offer a GTT store, so only its limit is asked for.
+    size_t lockable = SIZE_MAX;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        lockable = std::min(lockable, ggml_backend_dev_gtt_store_lockable(d));
+    }
+    // NB: SIZE_MAX means "no lock policy applies" -- either the limit is unlimited, or `MOE_EXPERT_GTT_MLOCK=0`
+    // turned locking off.  The loader cannot tell those apart and must not try: the GTT store's own census
+    // reports the truth (`mlocked X of Y` / `NOT locked ... RECLAIMABLE`), and all this function needs is the
+    // number the policy is clamped to.
+
+    // `-lme` is a CAP, not a floor: never register space no expert can occupy.  `extent_trunk` is the part the
+    // budget buys; the head's tables (P3c) are on top of it, because they are not the policy's to spend.
+    size_t extent_trunk = std::min(budget, padded_total);
+    size_t extent       = extent_trunk + head_padded;
+
+    if (extent > lockable) {
+        // The store cannot be locked as asked.  Two questions decide what happens, and the second is the one that
+        // matters: **can this model run without a locked store at all?**  Weights may occupy at most 90 % of
+        // MemAvailable (the same 10 % reserve the `-lme` argv check applies); whatever exceeds that is the
+        // minimum the GTT store has to hold, because on an APU there is nowhere else for it to live.
+        const size_t weights   = weights_total;
+        const size_t fit_cap   = fit_cap_now;
+        const size_t shortfall = weights > fit_cap ? weights - fit_cap : 0;
+        const size_t honour    = std::min(lockable, padded_total + head_padded);   // what the limit still lets us lock+place
+        // A clamp smaller than the smallest candidate table buys nothing at all -- do not register (and lock) a
+        // region no expert can occupy, go straight to the decline/refuse branch.
+        size_t smallest = padded_total;
+        for (const auto & c : cands) {
+            smallest = std::min(smallest, GGML_PAD(c.nbytes + 4096, 4096));
+        }
+        const bool clamp_useful = honour >= smallest;
+        const std::string lim  = lockable == SIZE_MAX ? "unlimited" : format("%.1f MiB", (double) lockable / mib);
+        // Whether a store that fits can make a >RAM model RUNNABLE.  Today it cannot: the GTT store is a static
+        // placement with no eviction (P3) and no streaming fill (P4/P5), so the experts that do not fit still
+        // need their layer's device buffer and the load over-commits -- measured precedent: 121 GiB resident +
+        // 13 GiB swap on a 123 GiB box (2026-10-19).  So a model that cannot fit is refused rather than left to
+        // thrash.  P3/P4 flip this to true, and the clamp branch below becomes reachable.
+        // P3/P4/P5 have landed, so a LOCKED store CAN stream -- and that is what makes a set larger than RAM
+        // runnable.  It is gated on `-lme` (maintainer decision, 2026-11-11): an operator who asked for a budget
+        // gets the streaming tier, and one who did not gets the pre-campaign behaviour (decline/refuse) instead of
+        // a tier they never asked for.  The clamp must still cover one slot per expert table, or the arena could
+        // not serve a single table and placement would over-commit -- that is checked below with `arena_min`.
+        const bool gtt_store_can_stream = lme_given;
+        const bool clamps_but_cannot_stream = clamp_useful && honour >= shortfall && !gtt_store_can_stream;
+        const char * advice =
+            "Raise RLIMIT_MEMLOCK (`ulimit -l` shows it): `LimitMEMLOCK=infinity` in the systemd unit, "
+            "`DefaultLimitMEMLOCK=infinity` in /etc/systemd/system.conf, `* - memlock unlimited` in "
+            "/etc/security/limits.conf, or run with CAP_IPC_LOCK.  `-lme auto` sizes the GTT store to whatever "
+            "the limit allows.";
+
+        if (shortfall == 0 && !clamp_useful) {
+            // (a) the model fits without the store, and the limit is too small to buy a useful one: this is an
+            // optimisation, not a lifeline -- decline it and keep today's behaviour.
+            LLAMA_LOG_WARN("%s: no GTT expert store: %s resolves to %.1f MiB and RLIMIT_MEMLOCK is %s.  This model "
+                           "fits in RAM without it (weights %.1f MiB of %.1f MiB MemAvailable), so the expert "
+                           "weights keep their layer's device buffer.  %s\n", __func__, source.c_str(),
+                           (double) extent / mib, lim.c_str(), (double) weights / mib, (double) avail / mib, advice);
+            return;
+        }
+        if (shortfall == 0) {
+            // (a') same model, but the limit still buys a real (smaller) store: take the clamp, loudly.
+            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
+                           "MiB (this model fits in RAM anyway, so this is an optimisation).  %s\n", __func__,
+                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib, advice);
+            extent = honour;
+            extent_trunk = honour > head_padded ? honour - head_padded : 0;
+            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
+        } else if (clamp_useful && honour >= shortfall && honour >= arena_min && gtt_store_can_stream) {
+            // (b) the model does NOT fit in RAM, but the clamp still covers what RAM cannot give it: run.
+            LLAMA_LOG_WARN("%s: %s resolves to %.1f MiB but RLIMIT_MEMLOCK is %s; clamping the GTT store to %.1f "
+                           "MiB, which still covers the %.1f MiB this model cannot fit in RAM.  %s\n", __func__,
+                           source.c_str(), (double) extent / mib, lim.c_str(), (double) honour / mib,
+                           (double) shortfall / mib, advice);
+            extent = honour;
+            extent_trunk = honour > head_padded ? honour - head_padded : 0;
+            source += format(", clamped to RLIMIT_MEMLOCK (%.1f MiB)", (double) lockable / mib);
+        } else {
+            // (c) it cannot be honoured and the model cannot run without it: REFUSE, before a byte is read.
+            // 2026-10-19 is why: an unchecked APU load went to 121 GiB resident + 13 GiB swap.
+            throw std::runtime_error(format(
+                "GTT expert store: this model cannot run with an unlocked store, and the store cannot be "
+                "locked.\n"
+                "  weights             %.1f MiB\n"
+                "  MemAvailable        %.1f MiB  (90%% of it is %.1f MiB: the ceiling the weights may occupy)\n"
+                "  shortfall           %.1f MiB  must live in the GTT store for this model to run at all\n"
+                "  asked for           %.1f MiB  (%s)\n"
+                "  RLIMIT_MEMLOCK      %s\n"
+                "  could honour        %.1f MiB\n"
+                "A registered-only GTT store is RECLAIMABLE under memory pressure -- the kernel swaps parts of it "
+                "and the next GPU read stalls 12-37x while the driver faults them back (measured, "
+                "wip/apu-expert-gtt/MEASUREMENTS.md §15) -- so it cannot be what makes this model fit.%s  %s",
+                (double) weights / mib, (double) avail / mib, (double) fit_cap / mib, (double) shortfall / mib,
+                (double) extent / mib, source.c_str(), lim.c_str(), (double) honour / mib,
+                clamps_but_cannot_stream
+                    ? "\n  And even a LOCKED store of that size would not make it runnable in this build: it has no "
+                      "eviction (P3) or streaming fill (P4), so the experts that do not fit would still take their "
+                      "layer's device buffer and the load would over-commit."
+                    : "",
+                advice));
+        }
+    }
+    if (extent < 4096) {
+        LLAMA_LOG_WARN("%s: no GTT expert store: the %.1f MiB budget (from %s) is smaller than a page\n",
+                       __func__, (double) extent / mib, source.c_str());
+        return;
+    }
+
+    // --- 2c. The SHAPE: RESIDENCY when the budget cannot hold the set, PLACEMENT when it can ------------
+    //
+    // `-lme` means what its own help text says: *cap the NON-SWAPPABLE memory spent on MoE experts*.  On an APU
+    // that promise decides the shape:
+    //   * the store CAN hold the whole expert set -> PLACEMENT: every expert is placed in the registered region,
+    //     nothing is evicted, nothing is read from the file.  This is the low-risk arm and the fastest one.
+    //   * it CANNOT (the ordinary case for `-lme N` below the set) -> the excess has to live somewhere else, and
+    //     the only place on this box is the FILE-BACKED PAGE CACHE -- which is reclaimable, i.e. it honours the
+    //     "non-swappable" cap.  That is the ARENA: the store is the cache's slot storage, the expert tensors
+    //     stay as holes in the read-only model mapping, and LFRU residency serves every read.
+    //
+    // MEASURED, and it is why the rule is keyed on the budget rather than on the model's fit (2026-11-11): with
+    // `-lme 4` on a 35B-A3B (an 18.2 GiB expert set, a model that FITS this box), placement leaves 34 GiB of
+    // anonymous, non-reclaimable memory in use (lowest MemAvailable 92 489 MiB) while the arena leaves 20.4 GiB
+    // (106 064 MiB) -- a 13.6 GiB difference, because the arena's unplaced experts are reclaimable page cache.
+    // The price of the cap is real too: 1453 -> 382 t/s prefill and 62.5 -> 31.6 t/s decode, from a 25.5 % miss
+    // rate (25 212 fills per 96 tokens).  `-lme auto` (the default) asks for no cap, so a set that fits the store
+    // is PLACED and runs at full speed; an explicit small `-lme` asks for a cap and gets the arena, as documented.
+    //
+    // `MOE_EXPERT_GTT_ARENA=1` forces the arena and `=0` forces placement, so an operator can override either
+    // way; the arena can only engage where there is something to stream (the condition below).
+    //
+    // NOTE the old form was `getenv(...) != nullptr`, i.e. `MOE_EXPERT_GTT_ARENA=0` ENABLED the tier.  A tri-state
+    // that cannot spell "off" is not a switch, so it is parsed now.
+
+    // --- 2c-bis. a store may ALREADY BE LIVE for this process ----------------------------------------
+    //
+    // A second model is a normal shape, not an edge case: the MTP head can be a SEPARATE model file (Flash-Next's
+    // `mtp-...-shared-*.gguf`: one qwen4exp nextn block, 3 expert tables, 2.6 GiB), and llama-bench reloads the
+    // same model between reps.  The GTT store is ONE region per device for the whole process, so a second load
+    // must not:
+    //   * SIZE it or grow it -- the extent is the FIRST model's budget, and it was clamped to RLIMIT_MEMLOCK and
+    //     to 90 % of MemAvailable for that model;
+    //   * take the ARENA tier -- the cache's slots are reserved out of the same free list, so a head carved from
+    //     it would silently shrink the trunk's arena (measured: 2 550 MiB of a 8 192 MiB arena);
+    //   * ask for a carve it cannot get -- `ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer` returning null
+    //     FAILS the model load (measured: `unable to allocate ROCmGTTStore0 buffer`, exit 1), it is not the
+    //     fail-soft decline the code used to claim.
+    // So: place within what is actually FREE, and decline cleanly (the weights keep their layer's device buffer,
+    // which on UMA is the same host RAM and is already fully resident) when that is not a whole table.
+    size_t live_free = SIZE_MAX;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const size_t f = ggml_backend_dev_gtt_store_free_bytes(d);
+        if (f != SIZE_MAX && f < live_free) {
+            live_free = f;
+        }
+    }
+    const bool store_live = live_free != SIZE_MAX;
+    if (store_live) {
+        // A store from an earlier load is live: it is not ours to size, and its free space is the whole budget.
+        size_t smallest_table = padded_total;
+        for (const auto & c : cands) {
+            smallest_table = std::min(smallest_table, GGML_PAD(c.nbytes + 4096, 4096));
+        }
+        if (live_free < smallest_table) {
+            LLAMA_LOG_WARN("%s: a GTT expert store is already live on this device and has %.1f MiB free, less than "
+                           "the smallest expert table (%.1f MiB), so this load places nothing in it: %s.  On UMA "
+                           "the device buffer is the same host RAM the store would have held, it is already fully "
+                           "resident, and it is NOT a cache table -- so these draft weights cannot be evicted.  "
+                           "The shape this happens for is the SEPARATE MTP drafter model (e.g. Flash-Next's "
+                           "`mtp-...-shared-*.gguf`), whose 3 head tables are its whole expert set.\n", __func__,
+                           (double) live_free / mib, (double) smallest_table / mib,
+                           live_free == 0
+                               ? "the region is either this run's ARENA (its extent is the trunk's budget, and "
+                                 "carving the head out of it would shrink the trunk's residency) or a placement "
+                                 "carve that filled it"
+                               : "what is left of the live store");
+            return;
+        }
+        LLAMA_LOG_WARN("%s: a GTT expert store is already live on this device with %.1f MiB free; this load sizes "
+                       "nothing and takes no arena tier -- it places at most that much in it and keeps everything "
+                       "else in its layer's device buffer (a second model: the head of a separate MTP drafter, or "
+                       "a reload of the same model)\n", __func__, (double) live_free / mib);
+        if (live_free < extent) {
+            extent_trunk = live_free > head_padded ? live_free - head_padded : 0;
+            extent       = std::min(extent, live_free);
+            source += format(", capped to the live store's %.1f MiB free", (double) live_free / mib);
+        }
+    }
+
+    // The test is the TRUNK: `extent` already carries the head's bytes on top of the budget (P3c), so comparing
+    // the total against the trunk's own padded size would never engage the arena on a model with a head.
+    if (arena_wanted && lme_given && !store_live && extent_trunk < padded_total) {
+        // Every table must be able to hold at least one slot, or the cache would serve some op from the
+        // pageable mapping -- a fatal GPU fault on this hardware, not a slow path.  Ask for the sum of one slot
+        // per table before enabling the tier at all.
+        if (extent < arena_min) {
+            LLAMA_LOG_WARN("%s: the GTT arena would be %.1f MiB, below the %.1f MiB one slot per expert table "
+                           "needs; falling back to whole-tensor placement\n", __func__,
+                           (double) extent / mib, (double) arena_min / mib);
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (d == nullptr || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                // P3c: the head's expert layers, so the cache can pin them at full residency and keep their
+                // bytes out of the trunk's budget.
+                int head_layers[512];
+                int n_head_layers = 0;
+                for (const auto & c : head_cands) {
+                    bool seen = false;
+                    for (int k = 0; k < n_head_layers && !seen; k++) {
+                        seen = head_layers[k] == c.layer;
+                    }
+                    if (!seen && c.layer >= 0 && c.layer < 512) {
+                        head_layers[n_head_layers++] = c.layer;
+                    }
+                }
+                if (!ggml_backend_dev_gtt_store_arena(d, extent, head_layers, n_head_layers)) {
+                    continue;
+                }
+                // The tier's fill master IS the read-only model mapping: a set that does not fit cannot be
+                // COPied into RAM, and the whole design is "the mapping is the source of truth, the arena is
+                // the resident subset".  A `--load-mode` that would copy the expert tensors instead (the AUTO
+                // default on an iGPU -- `caps.mmap_support` is false for an IGPU device, so AUTO resolves to
+                // `none`) is therefore forced to a mapped load here, or the master is a pageable full copy of
+                // the set (measured +18 662 MiB of anonymous memory on 35B-A3B, which is exactly the memory
+                // this tier exists to avoid).  Only the ARENA arm does this: whole-tensor placement fills the
+                // store from the GGUF and never reads a master.
+                if (!use_mmap) {
+                    use_mmap = true;
+                    LLAMA_LOG_WARN("%s: the GTT arena tier needs the read-only MODEL MAPPING as its fill master, so "
+                                   "this load is MAPPED (`--load-mode mmap`) whatever the AUTO resolution chose: an "
+                                   "iGPU reports no `mmap_support`, and without the mapping the expert tensors would "
+                                   "be a pageable full copy of the %.1f MiB set -- the memory this tier exists to "
+                                   "avoid.  Pass `--load-mode mmap` explicitly to keep the logs quiet.\n",
+                                   __func__, (double) padded_total / mib);
+                }
+                host_experts_store_arena = true;
+                host_experts_store_extent = extent;
+                source += arena_env != nullptr
+                              ? format(" [MOE_EXPERT_GTT_ARENA=%s: the operator forced %s]", arena_env,
+                                       arena_wanted ? "the arena" : "placement")
+                              : format(" [auto: -lme asks for a %.1f MiB cap on non-swappable expert memory "
+                                       "against a %.1f MiB set, so the excess streams from the file-backed page "
+                                       "cache (reclaimable) instead of becoming anonymous memory]",
+                                       (double) extent_trunk / mib, (double) padded_total / mib);
+                host_experts_policy = format(
+                    "%s -> the GTT store is the MoE ARENA: %.1f MiB of slots for a %.1f MiB expert set, the expert "
+                    "tensors stay in the read-only MODEL MAPPING (nothing allocated, nothing pinned) and every read "
+                    "is served from the arena with LFRU residency.  No in-place cold read on this tier (the "
+                    "mapping is not GPU-addressable), so every miss evicts and fills.%s",
+                    source.c_str(), (double) extent / mib, (double) (padded_total + head_padded) / mib,
+                    head_padded > 0
+                        ? format("  The %.1f MiB MTP/nextn head is PINNED at full residency on top of that budget "
+                                 "(P3c): it is read on every draft step, so `-lme` does not trade it away.",
+                                 (double) head_padded / mib).c_str()
+                        : "");
+                LLAMA_LOG_WARN("%s: %s\n", __func__, host_experts_policy.c_str());
+                return;
+            }
+            LLAMA_LOG_WARN("%s: the GTT arena was declined at %.1f MiB; falling back to whole-tensor placement\n",
+                           __func__, (double) extent / mib);
+        }
+    }
+
+    // Placement keeps every expert the store does not hold as its layer's DEVICE allocation, so it cannot serve a
+    // model whose weights do not fit in RAM at all -- the load would over-commit and the box would swap (measured
+    // precedent, 2026-10-19: 121 GiB resident + 13 GiB swap on a 123 GiB box, then a thrashing run).  Reaching this
+    // point with such a model means streaming is not available, for one of exactly four reasons, and the fix differs
+    // per reason -- so say which and refuse, before a byte is read.
+    if (fit_cap_now == 0 || weights_total > fit_cap_now) {
+        const char * why =
+            !lme_given              ? "`-lme` was not given, and the GTT arena -- the tier that streams the part of "
+                                      "the expert set that does not fit -- is opted in BY `-lme`"
+          : store_live              ? "a GTT expert store is already live in this process (a second model), and it "
+                                      "is not this load's to size"
+          : extent < arena_min      ? "the budget is smaller than one slot per expert table, which is the minimum "
+                                      "the arena needs to serve a table at all"
+          : arena_env != nullptr    ? "MOE_EXPERT_GTT_ARENA=0 asked for placement, which cannot stream"
+          :                           "the arena is unavailable on this device";
+        throw std::runtime_error(format(
+            "GTT expert store: this model's weights (%.1f MiB) do not fit in RAM (%.1f MiB available, "
+            "%.1f MiB is the ceiling they may occupy), so the part that does not fit has to be streamed -- and "
+            "streaming is not available here:\n"
+            "  %s\n"
+            "  asked for           %s\n"
+            "Pass `-lme N` (N GiB of non-swappable expert memory) or `-lme auto` to opt into the GTT arena, which "
+            "streams the remainder from the file-backed page cache; `-lme auto` sizes it to whatever RAM and "
+            "RLIMIT_MEMLOCK allow.  Without a budget this load would place the unplaced experts as device "
+            "allocations, over-commit, and swap.",
+            (double) weights_total / mib, (double) avail / mib, (double) fit_cap_now / mib, why, source.c_str()));
+    }
+
+    // --- 3. open the GTT store, once, before any tensor is placed ---------------------------------------
+    ggml_backend_buffer_type_t store_buft = nullptr;
+    ggml_backend_dev_t         store_dev  = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (d == nullptr || ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        store_buft = ggml_backend_dev_gtt_store_open(d, extent, source.c_str());
+        if (store_buft != nullptr) {
+            store_dev = d;
+            break;
+        }
+    }
+    if (store_buft == nullptr) {
+        // Nothing to say when the operator turned the GTT store off: that path must be byte-identical to the
+        // behaviour before this phase, including its log.
+        static const bool gtt_off = [] {
+            const char * e = getenv("MOE_EXPERT_GTT");
+            return e != nullptr && atoi(e) == 0;
+        }();
+        if (!gtt_off) {
+            LLAMA_LOG_WARN("%s: no GTT expert store on this device; the expert weights keep their layer's "
+                           "device buffer\n", __func__);
+        }
+        return;
+    }
+
+    // --- 4. rank by the persisted heat prior (the SAME prior, and the same call, as the discrete arm) --
+    ggml_backend_dev_t heat_dev = nullptr;
+    if (!files.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
+                if (heat_dev == nullptr) {
+                    heat_dev = d;
+                }
+            }
+        }
+    }
+    bool heat_seen = false;
+    if (heat_dev != nullptr) {
+        for (auto & c : cands) {
+            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts,
+                                                              c.expert_bytes);
+            if (s >= 0) {
+                c.score = s;
+                heat_seen = true;
+            }
+        }
+    }
+    if (heat_seen) {
+        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
+            return a.score > b.score;
+        });
+    }
+
+    // --- 5. take the hottest whole tables that fit --------------------------------------------------
+    size_t  planned = 0;
+    int     n_tables = 0;
+    int64_t n_slots  = 0;
+    // P3c: the MTP/nextn head's tables go in FIRST and unconditionally -- the head is read on every draft step,
+    // so the budget does not get to drop it.  They are counted in `planned`, which is why the trunk loop below
+    // can only spend what is left of `extent` (i.e. the `-lme` budget, since the head's bytes were added on top).
+    for (const auto & c : head_cands) {
+        const size_t need = GGML_PAD(c.nbytes + 4096, 4096);
+        if (planned + need > extent) {
+            break;   // cannot happen: `extent` includes the head's bytes; never place it unconditionally anyway
+        }
+        host_experts_store.insert(c.name);
+        host_experts_store_pinned.insert(c.name);
+        planned   += need;
+        n_tables  += 1;
+        n_slots   += c.n_experts;
+    }
+    for (const auto & c : cands) {
+        const size_t need = GGML_PAD(c.nbytes + 4096, 4096);
+        if (planned + need > extent) {
+            continue;   // a smaller table below may still fit
+        }
+        host_experts_store.insert(c.name);
+        planned   += need;
+        n_tables  += 1;
+        n_slots   += c.n_experts;
+    }
+    if (n_tables == 0) {
+        size_t smallest_table = GGML_PAD(cands.back().nbytes + 4096, 4096);
+        for (const auto & c : cands) {
+            smallest_table = std::min(smallest_table, GGML_PAD(c.nbytes + 4096, 4096));
+        }
+        LLAMA_LOG_WARN("%s: the %.1f MiB GTT expert store holds no whole expert table (the smallest is %.1f "
+                       "MiB); every expert keeps its layer's device buffer%s\n", __func__, (double) extent / mib,
+                       (double) smallest_table / mib,
+                       store_live ? "  The store is already live for this process, so this load could only place "
+                                    "what was still free in it -- and on UMA that device buffer is the same host "
+                                    "RAM the store would have held, already fully resident (the head of a "
+                                    "separate MTP drafter is the shape this happens for)."
+                                  : "");
+        return;
+    }
+
+    host_experts_store_buft   = store_buft;
+    host_experts_store_extent = extent;
+    host_experts_store_tables = n_tables;
+    host_experts_store_slots  = n_slots;
+    host_experts_policy = format("%s -> a registered GTT expert store of %.1f MiB of a %.1f MiB expert set: %d "
+                                 "tables / %lld (tensor, expert) slots (%.1f MiB) resident, ranked by the %s%s.  "
+                                 "Everything else keeps its layer's device buffer; eviction and streaming "
+                                 "fills are not in this phase (P3/P4).%s",
+                                 source.c_str(), (double) extent / mib, (double) total / mib, n_tables,
+                                 (long long) n_slots, (double) planned / mib,
+                                 heat_seen ? "persisted heat prior" : "model tensor order (no heat prior)",
+                                 extent_trunk >= padded_total ? "; the WHOLE set, zero evictions" : "; a hot subset",
+                                 host_experts_store_pinned.empty()
+                                     ? ""
+                                     : format("  %zu MTP/nextn head table(s) of the %.1f MiB head are placed "
+                                              "FIRST and pinned outside the budget (P3c).",
+                                              host_experts_store_pinned.size(),
+                                              (double) host_experts_store_head_bytes / mib).c_str());
+    // The decision is the thing to see, at WARN like the other tier censuses (issue #274: an INFO line is
+    // invisible at the default verbosity, and a user must be able to see which expert tier they got).
+    LLAMA_LOG_WARN("%s: %s\n", __func__, host_experts_policy.c_str());
+    GGML_UNUSED(store_dev);
+}
+
+void llama_model_loader::report_host_expert_placement() {
+    // wip/apu-expert-gtt P2: the GTT expert store's census, once per load, through the device that owns it (the
+    // backend knows the region's realised extent, its registration mode and its huge-page granularity; the
+    // loader knows how many slots it placed and how many bytes it read in).
+    if (host_experts_store_buft != nullptr) {
+        ggml_backend_dev_t store_dev = ggml_backend_buft_get_device(host_experts_store_buft);
+        if (store_dev != nullptr) {
+            ggml_backend_dev_gtt_store_report(store_dev, host_experts_store_filled,
+                                              host_experts_store_tables, host_experts_store_slots);
+        }
+    }
+    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
+        return;
+    }
+    // Always at WARN: a user must be able to see which tier they got.  The pageable fallback costs about half
+    // the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires when a
+    // pinned allocation is refused, not when the policy chose not to pin.
+    //
+    // issue #274: it used to be INFO, which is INVISIBLE at the default verbosity (common/log.cpp maps
+    // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE against a default threshold of LOG_LEVEL_INFO).  The reporter
+    // could see only the WARN lines -- the failures -- and not one of the decisions that produced them.
+    const double mib = 1024.0 * 1024.0;
+    std::string src = "";
+    if (host_experts_sourceable > 0) {
+        // The pool is built per host tensor from this registration; a mismatch against the pageable tensor
+        // count is the first thing a "the pool never appears" report needs to know.
+        src = format(", %zu/%zu pool sources registered", host_experts_sources, host_experts_sourceable);
+        if (host_experts_sources < host_experts_sourceable) {
+            src += " -- the unregistered tensors cannot use the pool (their buffer names no device); the "
+                   "per-table bounce ring serves them";
+        }
+    }
+    LLAMA_LOG_WARN("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB%s; %s\n", __func__,
+                   (double) host_experts_pinned_bytes / mib,
+                   (double) host_experts_total_bytes / mib,
+                   host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
+                       : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
+                                                      : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
+                   (double) host_experts_holes_bytes / mib, src.c_str(),
+                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -98,8 +1170,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
         throw std::runtime_error(format("invalid split file: %s", path.c_str()));
     }
 
-    for (int idx = 0; idx < n_split; ++idx) {
-        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), idx, n_split);
+    for (int i = 0; i < n_split; ++i) {
+        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
         paths.push_back(std::string(buf.data(), ret));
     }
 
@@ -542,15 +1614,19 @@ llama_model_loader::llama_model_loader(
         std::vector<std::string> & splits,
         FILE * file,
         llama_load_mode load_mode,
+        llama_host_experts_mode host_experts_mode,
+        int64_t host_experts_limit_gib,
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool allow_nextn_cpu_offload,
+        int  n_cpu_moe_from_end,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
-        trace = atoi(getenv("LLAMA_TRACE"));
+    if (const char * e = getenv("LLAMA_TRACE")) {
+        trace = atoi(e);
     }
 
     if (param_overrides_p != nullptr) {
@@ -560,9 +1636,56 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+    this->allow_nextn_cpu_offload = allow_nextn_cpu_offload;
+    this->n_cpu_moe_from_end      = n_cpu_moe_from_end;
 
-    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+    // rdna-boosts: BUFFERED keeps a MAPPED master (a pool-backed host master needs the mapping to live in) and
+    // only changes how a host read is served -- one buffered `pread` per expert instead of a demand fault per
+    // 4 KiB page.  It is the combination that used to be unrepresentable.
+    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
+                          load_mode == LLAMA_LOAD_MODE_AUTO || load_mode == LLAMA_LOAD_MODE_BUFFERED;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    // rdna-boosts: tell the host cache which READ TRANSPORT to use for a host-resident weight.  `--load-mode`
+    // is the operator's caching decision, so it IS this decision:
+    //     mmap / mmap+mlock / none / mlock -> the mapping (a plain memcpy out of the page cache, or out of a
+    //                                        fully resident master)
+    //     buffered                         -> a buffered `pread` per expert (the mapping's fault storm is
+    //                                        what collapses under memory pressure)
+    //     dio                              -> O_DIRECT all the way down
+    //     auto                             -> ADAPTIVE: start optimistically on the mapping and let the
+    //                                        runtime monitor fall down the ladder (stall detection + a
+    //                                        probe-fill A/B) if the page cache stops holding the set
+    // The three explicit arms LOCK the transport; `auto` is the only adaptive one.  `MOE_HOST_POOL_TRANSPORT`
+    // and `MOE_HOST_POOL_DIO` still override, and a library consumer that never runs this call keeps the
+    // historical heuristic.
+    {
+        int transport = 0;   // POOL_TR_MAP: the mapping
+        if (load_mode == LLAMA_LOAD_MODE_DIRECT_IO) {
+            transport = 2;   // POOL_TR_DIO
+        } else if (load_mode == LLAMA_LOAD_MODE_BUFFERED) {
+            transport = 1;   // POOL_TR_FILE
+        } else if (load_mode == LLAMA_LOAD_MODE_AUTO) {
+            transport = 3;   // ADAPTIVE
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_get(i), transport);
+        }
+    }
+
+    // Host-resident expert weights are pinned by default (`ROCm_Host`): the GPU reads the host master in
+    // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+    // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+    this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
+    this->host_experts_limit_gib = host_experts_limit_gib;
+    llama_host_experts_mode_apply(host_experts_mode, __func__);
+    if (this->host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL && !this->use_mmap) {
+        // The pool-backed master is a MODEL MAPPING: without mmap there is no mapping to place the tensors in,
+        // so the full pinned master has to stay (a pageable full copy would be no better than pinned, and the
+        // pool would still read the GGUF).
+        LLAMA_LOG_WARN("%s: --host-experts pool without mmap (--load-mode none/dio): the full pinned host "
+                       "expert master is kept, because the pool-backed master is the read-only model mapping.  "
+                       "Use the default mmap load mode (or MOE_HOST_POOL_DIO=1 with mmap) to drop it.\n", __func__);
+    }
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1103,9 +2226,11 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
         return false;
     }
 
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
+    // do not lazy-read small tensors, it has significant overhead and is not worth it.
+    // MLOCK is deliberately not filtered: its whole point is to pin the marked set, whatever each
+    // table weighs, so it behaves like ON here (no 4 GiB threshold).
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode == LLAMA_LAZY_MODE_AUTO && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1116,24 +2241,251 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     }
 
     if (w) {
-        ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
 
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        if (mode == LLAMA_LAZY_MODE_MLOCK || mode == LLAMA_LAZY_MODE_MLOCKR) {
+            // Deliberately NOT added to `ranges`: that set is handed to llama_mmap, which applies
+            // POSIX_MADV_RANDOM to it -- readahead is exactly what the one bulk population of this
+            // table needs.  mlock_ranges() pins it (populate + mlock) once the mapping exists.
+            auto & rs = pin[w->idx];
+            bool seen = false;
+            for (const auto & r : rs) {
+                seen = seen || (r.first == w->offs && r.second == w->offs + ggml_nbytes(t));
+            }
+            if (!seen) {
+                rs.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            }
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled, to be populated in the page cache (--lazy-mode %s)\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024,
+                    mode == LLAMA_LAZY_MODE_MLOCKR ? "mlockr" : "mlock");
+        } else {
+            ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        }
     }
 
     return true;
+}
+
+void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
+    if (pin.empty()) {
+        return;
+    }
+
+    if (!llama_mlock::SUPPORTED) {
+        LLAMA_LOG_WARN("%s: --lazy-mode mlock is not supported on this system, so the tables are NOT pinned: "
+                "they stay on the on-demand path and their pages are reclaimable page cache\n", __func__);
+        return;
+    }
+
+    const size_t gran = llama_mlock::granularity();
+    if (gran == 0) {
+        LLAMA_LOG_WARN("%s: page size is unknown, cannot pin the tables\n", __func__);
+        return;
+    }
+
+    // r273: DO NOT POPULATE (AND PIN) A TABLE THE BOX CANNOT HOLD.  `mlock`/`mlockr` pull the WHOLE marked
+    // table into the page cache first, and this runs at the very END of the load, when the model mapping, the
+    // host expert pool and the arena reserve are already committed.  A table larger than what is left turns
+    // that populate into a reclaim storm and, for `mlock`, into unevictable memory the run can never give back
+    // (measured shape: `MemAvailable` bottoming at 1.0 GiB with VmRSS 76.1 GiB, and a 13 t/s rep in one run).
+    // Declining is NOT a silent no-op: the tensors keep the on-demand path (`lazy.has()` is already true), i.e.
+    // exactly the `--lazy-mode auto` behaviour, which is the safe arm when the residency cannot be afforded.
+    // `LLAMA_LAZY_MLOCK_RESERVE_MIB` (default 1024) is what the populate keeps free.
+    {
+        size_t want = 0;
+        for (const auto & it : pin) {
+            for (const auto & r : it.second) {
+                want += r.second > r.first ? r.second - r.first : 0;
+            }
+        }
+        static const size_t reserve = [] {
+            const char * e = getenv("LLAMA_LAZY_MLOCK_RESERVE_MIB");
+            const long long v = e == nullptr ? 1024 : atoll(e);
+            return (size_t) (v > 0 ? v : 0) * 1024 * 1024;
+        }();
+        const size_t avail = host_experts_available_bytes();
+        if (avail > 0 && want + reserve > avail) {
+            LLAMA_LOG_WARN("%s: --lazy-mode %s DECLINED: the marked tables are %.1f MiB and only %.1f MiB is "
+                    "available (%.1f MiB kept back, LLAMA_LAZY_MLOCK_RESERVE_MIB).  Populating them now would "
+                    "push the box into reclaim/swap for the whole run, so they stay on the ON-DEMAND path -- "
+                    "the same behaviour as --lazy-mode auto: rows are read from the mapping as they are used, "
+                    "and the pages are reclaimable.  Nothing is pinned and nothing is copied.\n",
+                    __func__, mode == LLAMA_LAZY_MODE_MLOCKR ? "mlockr" : "mlock",
+                    (double) want / (1024.0 * 1024.0), (double) avail / (1024.0 * 1024.0),
+                    (double) reserve / (1024.0 * 1024.0));
+            return;
+        }
+    }
+
+    size_t n_pinned  = 0;
+    size_t sz_pinned = 0;
+
+    for (const auto & it : pin) {
+        const uint32_t idx = it.first;
+
+        if (idx >= mappings.size() || mappings[idx] == nullptr) {
+            LLAMA_LOG_WARN("%s: no mapping for file %u, its tables are left on the page-cache path\n", __func__, idx);
+            continue;
+        }
+
+        auto * const base     = (uint8_t *) mappings[idx]->addr();
+        const size_t map_size = (mappings[idx]->size() + gran - 1) & ~(gran - 1);
+
+        for (const auto & r : it.second) {
+            const size_t first = r.first & ~(gran - 1);
+            const size_t last  = std::min((r.second + gran - 1) & ~(gran - 1), map_size);
+            if (last <= first) {
+                continue;
+            }
+
+            // Pull the WHOLE table into the page cache and pin it.  mlock() is specified to leave
+            // every page of the range resident, so this call is the populate (nothing else is
+            // needed, and nothing is copied); the madvise first is a bulk readahead hint so the
+            // pages arrive by the sequential path instead of one fault at a time.
+            llama_prefetch({{ base + first, last - first }});
+
+            auto lock = std::make_unique<llama_mlock>();
+            lock->init(base + first);
+            lock->grow_to(last - first);
+
+            const size_t locked = lock->size();
+            if (locked < last - first) {
+                LLAMA_LOG_WARN("%s: could not pin the %zu MiB table at file %u offset %zu (%zu MiB locked): "
+                        "it stays on the on-demand page-cache path and may be reclaimed.  "
+                        "Raise RLIMIT_MEMLOCK ('ulimit -l') to pin it\n",
+                        __func__, (last - first)/1024/1024, idx, first, locked/1024/1024);
+            } else {
+                n_pinned++;
+                sz_pinned += locked;
+            }
+
+            locks.emplace_back(std::move(lock));
+        }
+    }
+
+    // `--lazy-mode mlockr`: use mlock as a POPULATE, not as a residency guarantee.  The tables are pulled in
+    // and squeeze everything else exactly as `mlock` does, and then the pin is dropped: `munlock` only clears
+    // VM_LOCKED, so the pages stay hot in the page cache and become reclaimable again.  Motivation: on a box
+    // where the expert arena auto-sizes into every free byte, a 26.8 GiB unevictable lazy table leaves the
+    // model mapping as the only memory the kernel can take back, so the host-expert misses intermittently come
+    // from disk.  Measured (Qwen3.8-Flash-Next GSQ-RCO-IQ3_S, 2 devices `-sm tensor -ncmoe 48`, `-p 512`):
+    // `mlock` 1070-1282 t/s with a 13 t/s rep in one run and `MemAvailable` bottoming at 1.0 GiB (VmRSS
+    // 76.1 GiB); `mlockr` 1250-1286 t/s flat, every rep.  `-lzm off` is the other stable arm (1263-1296).
+    const bool release_pin = mode == LLAMA_LAZY_MODE_MLOCKR;
+    if (release_pin && !locks.empty()) {
+        size_t sz_released = 0;
+        for (auto & l : locks) {
+            sz_released += l->size();
+            l->release();
+        }
+        locks.clear();
+        GGML_UNUSED(sz_released);
+        LLAMA_LOG_INFO("%s: released the pin on %zu MiB of populated tables (--lazy-mode mlockr); "
+                "they stay in the page cache and are reclaimable again\n", __func__, sz_released/1024/1024);
+    }
+
+    if (n_pinned > 0) {
+        GGML_UNUSED(sz_pinned);
+        GGML_UNUSED(release_pin);
+        LLAMA_LOG_INFO("%s: pinned %zu table(s), %zu MiB in the page cache (--lazy-mode %s)\n",
+                __func__, n_pinned, sz_pinned/1024/1024, release_pin ? "mlockr" : "mlock");
+    }
+}
+
+void llama_model_loader::lazy_read::add_resident(const std::string & name, const llama_tensor_weight & w) {
+    // Deliberately NOT added to `ranges`: that set gets POSIX_MADV_RANDOM, which disables
+    // readahead on the mapping.  The tensor is not served from the mapping at all -- the
+    // loader reads it straight into its own host buffer -- and the direct read is the fast
+    // path (measured ~3.9 GB/s here vs ~0.2 GB/s for a MADV_RANDOM fault-in + copy).
+    resident.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) kept resident (--lazy-mode off, not mapped)\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
+void llama_model_loader::lazy_read::add_range(const std::string & name, const llama_tensor_weight & w) {
+    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+    tensors.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) excluded from the load-time prefetch\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
+// wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
+// fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
+// layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
+// tensor across them; under `-sm layer`/single-GPU the host buffer already carries the layer's real device.
+// (Before this, every `-sm tensor` shard was keyed to device 0, which reserved the expert-cache arena on
+// device 0 only.)
+//
+// A host buffer type does not have to carry a device: `ggml_backend_cpu_buffer_type()` has
+// `.device = NULL` upstream (the FIXME in ggml-backend.cpp), so a plain CPU placement (a CPU-only
+// run, or `--override-tensor exps=CPU`) yields a null buft device.  Key the account to the layer's
+// real device in that case (the test harness's host-expert override is exactly this shape: the CPU
+// buffer type on a GPU layer), and skip it entirely when there is no device at all -- a CPU-only
+// model has no device to reserve a staging ring or expert-cache arena on, and inserting a null key
+// made `llama_context` abort in `ggml_backend_dev_memory`.
+static void moe_host_expert_account(std::map<ggml_backend_dev_t, size_t> & acc,
+        const std::string & name, size_t bytes, int64_t n_experts, ggml_backend_buffer_type_t buft,
+        const buft_list_t * buft_list_layer) {
+    if (buft == nullptr || !ggml_backend_buft_is_host(buft) || name.find("exps") == std::string::npos) {
+        return;
+    }
+    // Only a routed EXPERT BANK is accounted.  The name filter above also matches the per-expert
+    // side tensors some arches carry -- gemma4's `ffn_down_exps.scale` is 128 x F32 = 512 B per layer,
+    // i.e. 30 x 512 B = 15360 B of a 23.1 GiB host-expert set.  The expert cache only ever registers a
+    // `MUL_MAT_ID` bank (`weight->ne[2] >= 2`), so such a tensor made the cache's completeness check
+    // unsatisfiable by exactly that residue: no arena was ever sized and gemma4 paid a full per-op
+    // expert upload with zero residency (TODO #77).  A bank has an expert axis; a scale/bias vector has
+    // `ne[2] == 1`.
+    if (n_experts < 2) {
+        return;
+    }
+    ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_dev_t layer_dev = (buft_list_layer != nullptr && !buft_list_layer->empty())
+                                 ? buft_list_layer->front().first : buft_dev;
+    if (layer_dev != nullptr && ggml_backend_dev_is_meta(layer_dev)) {
+        const size_t n_dev = ggml_backend_meta_dev_n_devs(layer_dev);
+        if (n_dev > 0) {
+            const size_t per = bytes / n_dev;
+            size_t assigned = 0;
+            for (size_t d = 0; d < n_dev; d++) {
+                const size_t b = (d + 1 == n_dev) ? (bytes - assigned) : per;
+                ggml_backend_dev_t sdev = ggml_backend_meta_dev_simple_dev(layer_dev, d);
+                if (sdev != nullptr) {
+                    acc[sdev] += b;
+                }
+                assigned += b;
+            }
+            return;
+        }
+    }
+    // Only a PINNED host master is served by the host-expert machinery: the slab arena, the H2D
+    // staging ring and the expert cache all read the master in place from a device kernel, which
+    // needs a mapped (pinned) buffer.  `ggml_backend_cpu_buffer_type()` is the plain PAGEABLE CPU
+    // buffer and carries no device upstream (the FIXME in ggml-backend.cpp), so a CPU-only run or
+    // `--override-tensor exps=CPU` lands here: do not account it.  Accounting it with a null key
+    // aborted in `ggml_backend_dev_memory()` (a CPU-only model could not even create a context),
+    // and keying it to the layer device would reserve a slab ring/arena for a master this path
+    // copies (the upstream `llama_moe_cache` engine) instead of reading in place.  A pinned host
+    // buft always carries its device, so it is unaffected.
+    if (buft_dev == nullptr) {
+        return;
+    }
+    acc[buft_dev] += bytes;
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
+    bool is_lazy     = false;
+    bool is_resident = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_resident };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1188,9 +2540,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP) || (flags & TENSOR_SKIP_MANAGED)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_MANAGED)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1229,7 +2583,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list;
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
-                buft_list = buft_list_input;
+                // the per-layer token embedding is a huge table that the model gathers on the host
+                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
+                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
+                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
                 break;
             case LLM_TENSOR_LAYER_OUTPUT:
                 buft_list = buft_list_output;
@@ -1244,15 +2601,115 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
+        // `-ncmoe N` tail placement (the default): host the LAST N trunk layers' MoE experts instead of
+        // the caller's forward `blk.0..N-1` patterns.  The bound is strictly `[n_layer - N, n_layer)` --
+        // the appended nextn/MTP head (`tn.bid >= n_layer`) is excluded by construction, so an embedded
+        // MTP layer is never offloaded.  `LLAMA_HOST_EXPERTS_FROM_END=0` (handled in common) leaves
+        // `n_cpu_moe_from_end == 0`, which keeps the historical forward placement.
+        llama_model_tensor_buft_override tail_ov[2] = { { nullptr, nullptr }, { nullptr, nullptr } };
+        const llama_model_tensor_buft_override * tb_ov = tensor_buft_overrides;
+        if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
+                tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
+                tn.bid <  (int) hparams.n_layer()) {
+            // a per-TENSOR read: latch it (issue #273's getenv audit)
+            static const bool stage_trace = getenv("GGML_STAGE_TRACE") != nullptr;
+            if (stage_trace) {
+                fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
+                fflush(stderr);
+            }
+            tail_ov[0].pattern = ".*";
+            tail_ov[0].buft    = ggml_backend_cpu_buffer_type();
+            tb_ov = tail_ov;
+        }
+
         // check overrides
-        if (tensor_buft_overrides) {
+        if (tb_ov) {
             std::string tensor_name = tn.str();
-            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+            for (const auto * overrides = tb_ov; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    // The per-layer `blk.<i>` `-ncmoe` patterns were re-targeted to the tail above;
+                    // skip them so the front layers are not also hosted.  (Strictly `blk.`-prefixed, so
+                    // the all-layers `--cpu-moe` override and `--override-tensor` are kept.)  An
+                    // explicit `--override-tensor` / `--cpu-moe` list is left alone.
+                    if (n_cpu_moe_from_end > 0 && overrides->buft == ggml_backend_cpu_buffer_type() &&
+                            std::string(overrides->pattern).rfind("blk\\.", 0) == 0) {
+                        continue;
+                    }
+                    // The appended nextn/MTP layer(s) are the SPECULATIVE head, not the trunk.  A CPU
+                    // expert override from the main model (`-ncmoe`/`-cmoe`) must never offload them: the
+                    // patterns are `blk.<i>` for i in 0..N-1, so `-ncmoe 99` matches
+                    // `blk.<n_layer>.ffn_*_exps` and silently moves the MTP head's own experts to the host
+                    // (measured: Qwen3.6-35B-A3B, n_layer 40, `-ncmoe 41` -> blk.40 experts on ROCm_Host).
+                    // The separate-file MTP draft (loaded with the draft's own `--spec-draft-n-cpu-moe`
+                    // overrides) is protected by the same rule: its only layer is the nextn layer, and
+                    // offloading the speculative head is never what the user wants.  Keep it on the
+                    // layer's device; `--spec-draft-n-cpu-moe` still governs a draft model's trunk layers.
+                    if (overrides->buft == ggml_backend_cpu_buffer_type() &&
+                            !allow_nextn_cpu_offload &&
+                            info.layer == LLM_TENSOR_LAYER_REPEATING &&
+                            hparams.n_layer() > 0 && tn.bid >= (int) hparams.n_layer()) {
+                        static std::once_flag once_nextn;
+                        std::call_once(once_nextn, [&] {
+                            LLAMA_LOG_INFO("llama_model_loader: keeping the speculative (nextn) layer %d experts "
+                                           "on the device; -ncmoe/-cmoe only offload the %u trunk layers\n",
+                                           (int) tn.bid, hparams.n_layer());
+                        });
+                        continue;
+                    }
+                    if (overrides->buft == ggml_backend_cpu_buffer_type() && host_experts_umem) {
+                        // A shared host/device memory pool (an integrated GPU): hosting an expert here is a
+                        // page the GPU cannot address (see set_host_experts_umem).  Keep it on the device.
+                        static std::once_flag once_umem;
+                        std::call_once(once_umem, [&] {
+                            LLAMA_LOG_WARN("%s: keeping the expert weights on the device: this device's memory is "
+                                           "a shared host/device pool, so a host-resident expert master cannot be "
+                                           "read by the GPU (set_host_experts_umem)\n", __func__);
+                        });
+                        continue;
+                    }
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
-                        // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // Host-resident MoE experts: a device's host buffer type carries that device, and
+                        // the scheduler places the consumers of its tensors there.  Picking the device-0
+                        // host buffer for every layer would route every expert op to device 0 under
+                        // `-sm layer` (the other GPUs idle on the expert half).  Prefer the host buffer of
+                        // the device this layer is assigned to.
+                        if (op == GGML_OP_MUL_MAT_ID && buft_list_layer != nullptr && !buft_list_layer->empty()) {
+                            ggml_backend_dev_t layer_dev = buft_list_layer->front().first;
+                            ggml_backend_buffer_type_t layer_host_buft = host_expert_buft(layer_dev, tensor_name);
+                            if (layer_host_buft != nullptr &&
+                                    weight_buft_supported(hparams, t_meta, op, layer_host_buft, layer_dev)) {
+                                buft = layer_host_buft;
+                            }
+                        }
+                        // Under `-sm tensor` the layer's device is the Meta device.  Its host buffer type
+                        // is null when its simple devices have distinct per-device host buffer types
+                        // (our per-device ROCm_Host), so the fallback below would put the host expert
+                        // master in the pageable CPU_REPACK buffer.  A device reads that master directly
+                        // (the split upload / UVA), and it must also be recognised as host memory for the
+                        // loader's byte accounting and the MoE expert cache -- so prefer a real device's
+                        // pinned host buffer type.  LLAMA_TENSOR_HOST_BUFT=0 restores the CPU_REPACK path.
+                        static const bool tensor_host_buft = [] {
+                            const char * e = getenv("LLAMA_TENSOR_HOST_BUFT");
+                            return e == nullptr || atoi(e) != 0;
+                        }();
+                        if (buft == nullptr && tensor_host_buft && op == GGML_OP_MUL_MAT_ID) {
+                            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                                ggml_backend_buffer_type_t hb = host_expert_buft(dev, tensor_name);
+                                if (hb == nullptr || hb == ggml_backend_cpu_buffer_type()) {
+                                    continue;
+                                }
+                                if (weight_buft_supported(hparams, t_meta, op, hb, dev)) {
+                                    buft = hb;
+                                    break;
+                                }
+                            }
+                        }
+                        if (buft == nullptr) {
+                            // when overriding to a CPU buffer, consider the extra buffer types
+                            buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1272,6 +2729,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (!buft && host_experts_store_arena && op == GGML_OP_MUL_MAT_ID &&
+                tn.str().find("exps") != std::string::npos) {
+            // wip/apu-expert-gtt P3, ARENA mode: an expert table is a HOLE in the read-only model mapping.  The
+            // buffer type allocates nothing and pins nothing; `llama-model.cpp`'s `host_master_mapped` path puts
+            // the tensor straight into the mapping, and the cache serves every read of it from the GTT arena.
+            // It still carries this device, so the expert op stays on the GPU and the schedule is unchanged.
+            ggml_backend_dev_t layer_dev = (buft_list_layer != nullptr && !buft_list_layer->empty())
+                                         ? buft_list_layer->front().first : nullptr;
+            ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(layer_dev);
+            // No `weight_buft_supported()` here, deliberately: a host master reaches the GPU through the
+            // scheduler's OFFLOAD path (`ggml_backend_sched_backend_id_from_cur`: a host weight whose consumer
+            // `supports_op`/`offload_op` is offloaded to the device that OWNS the buffer type), not through
+            // `supports_buft` -- the buffer type carries its device for exactly that reason.  Asking the device
+            // to "support" a host buft declines it, and the tensor then silently stays on the device as a full
+            // allocation (measured: the whole 20 583 MiB model on the device and `tables=0` on the arena tier).
+            if (master != nullptr) {
+                buft = master;
+                LLAMA_LOG_DEBUG("%s: tensor %s is a mapping hole served by the GTT arena (%s)\n", __func__,
+                                tn.str().c_str(), ggml_backend_buft_name(buft));
+            }
+        }
+
+        if (!buft) {
+            // wip/apu-expert-gtt P2: a resident expert table the GTT store holds is placed IN the GTT store's
+            // device buffer type, so `MUL_MAT_ID` reads it in place with no new op and no per-layer copy.  The
+            // decision was made once (`plan_gtt_expert_store`), before any tensor was placed.
+            if (host_experts_store_buft != nullptr && op == GGML_OP_MUL_MAT_ID &&
+                    host_expert_is_store(tn.str())) {
+                buft = host_experts_store_buft;
+                LLAMA_LOG_DEBUG("%s: tensor %s placed in the GTT expert store (%s)\n", __func__,
+                                tn.str().c_str(), ggml_backend_buft_name(buft));
+            }
+        }
+
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
@@ -1280,8 +2771,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // avoid using a host buffer when using mmap
+        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type stays in the
+        // device's PINNED host buffer (`ROCm_Host`).  The expert cache reads the master in place on the
+        // GPU, and a pageable `CPU_Mapped` master has no device mapping without XNACK (issue #116); the
+        // scheduler's per-op H2D from pageable memory also faults/stalls on ROCm 7.14.  Pinning the
+        // expert set costs non-swappable RAM but is the only safe host master on RDNA.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+                op != GGML_OP_MUL_MAT_ID) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1339,7 +2836,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) { // e.g. TENSOR_SKIP
+            return nullptr;
+        }
+        if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
+            account_host_expert_tier(tn.str(), ggml_nbytes(&t_meta));
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
@@ -1352,9 +2855,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (flags & TENSOR_READ_LAZY && !files.empty()) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        // note: the user path (llama_model_init_from_user) has no files to lazy-read from, so the
+        //   tensor is created normally there and filled via set_tensor_data
+        const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
+        is_lazy = lazy.add(tn.str(), cur, w);
+
+        // an explicit `--lazy-mode off` overrides the mmap-backed buffer for these tensors, so
+        // `--load-mode mmap` keeps its fast mapped load for the bulk of the model while the
+        // PLE/engram table is still read into host RAM.  Only the explicit OFF does this: AUTO
+        // below its 4 GiB threshold stays on the normal (mapped) path, so default loads do not
+        // change.
+        if (!is_lazy && w != nullptr && lazy.mode == LLAMA_LAZY_MODE_OFF && use_mmap) {
+            lazy.add_resident(tn.str(), *w);
+            is_resident = true;
+        }
     }
 
     ggml_tensor t_meta = *cur;
@@ -1376,6 +2892,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+    if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
+        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
+        account_host_expert_tier(tn.str(), ggml_nbytes(&t_meta));
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
@@ -1420,6 +2940,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+// Release a tensor's host-mapping pages as soon as it has been uploaded to a device, so a large
+// offload does not have to hold the entire model mapping and the host expert pool at once.  The range
+// is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
+// the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
+static bool llama_load_release_mmap() {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_LOAD_RELEASE_MMAP"); return e == nullptr || atoi(e) != 0; }();
+    return enabled;
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1439,11 +2968,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            // With incremental release enabled, do not fault the whole file in up front: the loader
+            // then releases each tensor's pages as it uploads them, and an up-front full-file prefetch
+            // would still peak at model + host pool.  Kernel readahead keeps sequential reads efficient.
+            const size_t prefetch_size = prefetch && use_mmap && !llama_load_release_mmap() ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
-            mmaps_used.emplace_back(mapping->size(), 0);
+            mmaps_used.emplace_back();
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
@@ -1457,6 +2989,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
     }
+}
+
+void llama_model_loader::mark_mmap_used(uint32_t idx, size_t offs, size_t size) {
+    if (idx >= mmaps_used.size()) {
+        return;
+    }
+    mmaps_used[idx].emplace_back(offs, offs + size);
 }
 
 using mapping_ranges = std::vector<llama_model_loader::mapping_range>;
@@ -1576,10 +3115,12 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    const bool release_mmap = llama_load_release_mmap();
+
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
-    // NVMe raid configurations might require more / larger buffers.
+    // 4 staging buffers for async uploads, each sized `buffer_size` below (LLAMA_LOAD_STAGE_MB,
+    // default 4 MiB).  NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
 
     size_t alignment = 1;
@@ -1587,8 +3128,17 @@ bool llama_model_loader::load_all_data(
         alignment = std::max(file->read_alignment(), alignment);
     }
 
-    // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    // Buffer size: balance between memory usage and I/O efficiency.  `n_buffers` slots are
+    // allocated (4), so the staging ring holds n_buffers * buffer_size of pinned host memory.
+    // 4 MiB per slot measured best on gfx1201 + NVMe (Flash-Next, `-sm tensor --load-mode none`:
+    // 1 MiB 15.7 s, 2 MiB 13.7, 4 MiB 13.7, 8 MiB 14.8, 32 MiB 16.3, 64 MiB 16.8); larger slots
+    // scale better on faster disks at 4x the pinned footprint.  LLAMA_LOAD_STAGE_MB overrides.
+    static const size_t stage_size = [] {
+        const char * e = getenv("LLAMA_LOAD_STAGE_MB");
+        const long mb = e != nullptr ? strtol(e, nullptr, 10) : 0;
+        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 4 * 1024 * 1024;
+    }();
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : stage_size;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1614,6 +3164,15 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
+        // NOTE: a Meta device (under `-sm tensor`) is deliberately NOT excluded here.  Its async
+        // setter (`ggml_backend_meta_set_tensor_async`) splits a chunk to each simple device and
+        // handles a mid-row head/tail chunk with `write_partial_row`, so the loader's fixed-size
+        // chunks (NOT row-aligned for a quantized tensor, e.g. a q8_0 row stride of 4352 B) are
+        // safe.  A segmented tensor whose chunk starts mid-row, and a PARTIAL split tensor, fall
+        // back to the synchronous setter inside the Meta backend.  The event proxy fans a record
+        // out to every simple device, so the staging ring below still gets its backpressure.
+        // (The old `ggml_backend_dev_is_meta(dev) -> nullptr` bail predated that and forced the
+        // whole-tensor pageable `read_buf` path, which is several times slower on `--load-mode none`.)
         if (buft != ggml_backend_dev_buffer_type(dev)) {
             LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                 ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
@@ -1630,6 +3189,21 @@ bool llama_model_loader::load_all_data(
 
         auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
         if (!host_buft) {
+            // UPSTREAM PR #22466 (adapted): under `-sm tensor` the device is the Meta device.  The
+            // delivery made the pinned host buffer type per device, so the Meta device's simple
+            // devices' host bufts differ and it reports none.  Fall back to a real device's pinned
+            // host buft -- the staging allocation is device-agnostic (UVA) and only this function's
+            // per-upload ring uses it, so weight placement is unaffected.
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev_i = ggml_backend_dev_get(i);
+                ggml_backend_buffer_type_t hb = dev_i ? ggml_backend_dev_host_buffer_type(dev_i) : nullptr;
+                if (hb != nullptr && hb != ggml_backend_cpu_buffer_type()) {
+                    host_buft = hb;
+                    break;
+                }
+            }
+        }
+        if (!host_buft) {
             LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
                 ggml_backend_dev_name(dev));
             return nullptr;
@@ -1637,16 +3211,16 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf_host = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
-            if (!buf) {
+            if (!buf_host) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
                 return nullptr;
             }
 
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
+            host_buffers.emplace_back(buf_host);
+            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf_host));
 
             auto * event = ggml_backend_event_new(dev);
             if (!event) {
@@ -1710,7 +3284,18 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        // wip/apu-expert-gtt P2: a resident expert table the GTT store holds is filled STRAIGHT from the GGUF
+        // into its slot -- the buffered `pread` arm (15.7 GB/s measured, and it needs no alignment round-out,
+        // unlike `O_DIRECT` whose 4096-byte requirement a 32-byte-aligned GGUF offset cannot meet).  Two
+        // consequences here: it must not take the model-mapping path (that would `memcpy` from the page cache
+        // instead, and would re-fault the whole file), and the region is host-writable so the loader's own
+        // `read_raw` path is the fill.  `read_alignment() == 1` is a buffered file; an `O_DIRECT` load falls
+        // through to the staging path (a memcpy into the slot -- correct, just not the measured arm).
+        const std::string store_name = ggml_get_name(cur) != nullptr ? ggml_get_name(cur) : "";
+        const bool store_fill = host_expert_is_store(store_name) &&
+                                files.at(weight->idx)->read_alignment() == 1;
+
+        const bool from_mapping = (use_mmap || lazy.has(cur)) && !lazy.is_resident(cur) && !store_fill;
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1742,18 +3327,41 @@ bool llama_model_loader::load_all_data(
                     lmlock->grow_to(weight->offs + n_size);
                 }
 
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                // the tensor points directly into the mapping; the page must survive the load
+                mark_mmap_used(weight->idx, weight->offs, n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // The tensor now lives in a device (or non-mapping host) buffer, so its backing mmap
+                // pages are dead weight during the rest of the load.  Drop them incrementally: a
+                // full-file mapping plus the host expert pool otherwise has to be resident at once,
+                // which starves a memory-constrained host.  `madvise(MADV_DONTNEED)` is not enough
+                // here -- the ROCm runtime re-faults the pages on the next pageable H2D copy -- so the
+                // range is munmapped.  Not with `--mlock` (the pages were asked to stay) and not with
+                // `check_tensors` (the async validation may still be reading the range).
+                if (release_mmap && lmlocks == nullptr && !check_tensors && !lazy.has(cur)) {
+                    // never unmap a range a host-pointer tensor points into: a tied embedding is
+                    // loaded twice (once mmap-backed, once copied to a device) from the same range
+                    bool host_backed = false;
+                    for (const auto & r : mmaps_used[weight->idx]) {
+                        if (weight->offs < r.second && r.first < weight->offs + n_size) {
+                            host_backed = true;
+                            break;
+                        }
+                    }
+                    if (!host_backed) {
+                        mapping->unmap_fragment(weight->offs, weight->offs + n_size);
+                    }
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            if (store_fill || ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (store_fill) {
+                    host_experts_store_filled += n_size;
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1840,6 +3448,29 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        // wip/host-expert-dio-cache Phase 1: record the on-disk source of a host-resident expert tensor
+        // (`cur->data` is the pinned master the cache reads).  Inert unless MOE_HOST_POOL_MIB > 0.
+        // wip/host-expert-tier: a PINNED master needs no pool -- registering a source would build one beside
+        // it (measured: ~9% prefill for nothing, 1 009.4 against 1 105.4 t/s at 2 devices).
+        if (cur->data != nullptr && cur->buffer != nullptr && cur->ne[2] > 1 &&
+                ggml_backend_buffer_is_host(cur->buffer) &&
+                !host_expert_is_pinned(ggml_get_name(cur)) &&
+                std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
+            // issue #274: the census needs to know whether the registration REACHED the backend.  A host-expert
+            // bank in a pageable buffer whose tensor buffer carries no device (a CPU bdev, or a buffer type the
+            // backend does not own) silently registers nothing, and then the pool is never built for it -- so
+            // count the eligible tensors and the ones whose buffer names a device.
+            host_experts_sourceable++;
+            ggml_backend_dev_t src_dev =
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            if (src_dev != nullptr) {
+                host_experts_sources++;
+            }
+            ggml_backend_dev_moe_cache_set_host_source(
+                    src_dev, cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
+                    (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
+        }
+
         size_done += n_size;
     }
 
@@ -1871,11 +3502,20 @@ bool llama_model_loader::load_all_data(
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
-                const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
-                mapping->unmap_fragment(0, mmap_used.first);
-                if (mmap_used.second != 0) {
-                    mapping->unmap_fragment(mmap_used.second, mapping->size());
+                auto used = mmaps_used.at(idx);
+                std::sort(used.begin(), used.end());
+                size_t pos = 0;
+                for (const auto & r : used) {
+                    const size_t beg = std::min(r.first,  mapping->size());
+                    const size_t end = std::min(r.second, mapping->size());
+                    if (beg > pos) {
+                        mapping->unmap_fragment(pos, beg);
+                    }
+                    pos = std::max(pos, end);
+                }
+                if (pos < mapping->size()) {
+                    mapping->unmap_fragment(pos, mapping->size());
                 }
             }
         }

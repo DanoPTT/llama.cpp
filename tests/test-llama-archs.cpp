@@ -187,14 +187,27 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-// MoE archs that are also tested with the experts in host memory
+// MoE archs that are also tested with the experts in host memory.
+// Run ONE host-expert arch per process (`-a deepseek2`, `-a deepseek4`, `-a deepseek41`): the row arms the
+// movable-boundary slab, and a slab holds its VRAM for the rest of the process (ROCm cannot unmap a
+// sub-range), so a later arch's model would only have the slab headroom to load into.  The dsv4 arches are
+// here for the raw cache's synthetic reserve probe (its full-cache context and its write-index shape,
+// issue #300), which only runs when the model has host-resident experts.
 static bool host_experts_test(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return true;
         default:
             return false;
     }
+}
+
+// ... and of those, the ones whose fixture experts also fit the tiny device cache of the MoE-cache rows
+// (64 experts of the dsv4 fixture are 192 MiB in f16: too many for the few evicting slots those rows use)
+static bool moe_cache_test(const llm_arch arch) {
+    return arch == LLM_ARCH_DEEPSEEK2;
 }
 
 // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
@@ -809,10 +822,20 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
+        // block 11: the managed PLE reader's budget, handed over as LLAMA_LAZY_BUF_MB around the load
+        const size_t lazy_buf_size = 0) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
+    // parameter as an override by exporting the equivalent MiB value around the load
+    if (lazy_buf_size > 0) {
+        const size_t mb = lazy_buf_size / (1024*1024);
+        setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb > 0 ? mb : 1).c_str(), 1);
+    } else {
+        unsetenv("LLAMA_LAZY_BUF_MB");
+    }
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -833,8 +856,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const size_t lazy_buf_size = 0) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, lazy_buf_size);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1324,6 +1348,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (dc.host_experts && (!moe || !host_experts_test(arch))) {
                     continue;
                 }
+                if (dc.moe_cache_size > 0 && !moe_cache_test(arch)) {
+                    continue;
+                }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
 
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
@@ -1413,7 +1440,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                            // the qwen4exp PLE n-gram table gets a managed lazy-reader budget
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, arch == LLM_ARCH_QWEN4EXP ? 256 << 10 : 0);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                             status_roundtrip = "\033[1;32mOK\033[0m";

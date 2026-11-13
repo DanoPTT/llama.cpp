@@ -35,6 +35,7 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -70,6 +71,9 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    // llama_memory_i: the attention (iSWA) cache's Hadamard rotation entries
+    uint32_t graph_extra_entries() const override;
 
     // state write/load
 
