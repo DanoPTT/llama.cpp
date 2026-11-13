@@ -1791,12 +1791,22 @@ static void pool_fd_align(pool_fd_t fd, size_t * align) {
 }
 static pool_ssize_t pool_pread(pool_fd_t fd, void * dst, size_t len, size_t off) {
     const HANDLE h = (HANDLE) (intptr_t) fd;
+    // f711: one manual-reset event PER THREAD.  With `hEvent == NULL`, GetOverlappedResult waits on the FILE
+    // HANDLE, which any completion on it signals; the r277 placement queue runs `MOE_EXPERT_FILL_QD` readers on
+    // one handle, so a reader returned before its own read landed (wrong bytes in the pool) and the kernel later
+    // completed into its dead stack `OVERLAPPED` (silent crash in the prewarm).
+    static thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (ev == nullptr) {
+        return 0;   // the caller treats a short read as a failed fill and falls back
+    }
     size_t done = 0;
     while (done < len) {
         // `ReadFile` takes a DWORD length; a coalesced prefill span is a few MiB, so this is the whole range.
         const size_t left = len - done;
         const DWORD  n    = (DWORD) (left > (size_t) (1u << 30) ? (size_t) (1u << 30) : left);
         OVERLAPPED ov = {};
+        ResetEvent(ev);
+        ov.hEvent = ev;
         const unsigned long long o = (unsigned long long) (off + done);
         ov.Offset     = (DWORD) (o & 0xffffffffull);
         ov.OffsetHigh = (DWORD) (o >> 32);
