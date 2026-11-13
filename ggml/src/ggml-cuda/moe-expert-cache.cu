@@ -2713,12 +2713,12 @@ static void pool_report_layout_once_locked(const table_t & t, int slots, int64_t
     done = true;
     const double cov    = 100.0 * (double) slots / (double) t.n_experts;
     const bool   mirror = slots >= t.n_experts;
-    const bool   near   = !mirror && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts;
+    const bool   near_m = !mirror && (int64_t) (t.n_experts - slots) * 25 < (int64_t) t.n_experts;
     const char * shape  = mirror ? "a MIRROR (every expert of the table is resident)"
-                        : near   ? "a NEAR-MIRROR (coverage gap under 4 %)"
+                        : near_m ? "a NEAR-MIRROR (coverage gap under 4 %)"
                                  : "a COMPLEMENT of the arena (a sub-complement budget)";
     const char * exch   = !g_pool_sink     ? "the arena exchange is OFF (MOE_HOST_POOL_SINK=0)"
-                        : (mirror||near)   ? "the arena exchange is INERT for it (no reserve, no demote)"
+                        : (mirror||near_m) ? "the arena exchange is INERT for it (no reserve, no demote)"
                                            : "the arena exchange is ENGAGED for it";
     char budget[256];
     if (g_pool_budget_explicit) {
