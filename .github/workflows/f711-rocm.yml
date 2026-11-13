@@ -19,10 +19,10 @@ on:
       rocm_version:
         description: "ROCm version"
         required: false
-        # AMD's whl-next index serves only 10.0.0; 7.14.0 fails in Setup ROCm with
+        # AMD's whl-next index serves 10.1.0 and 10.0.0 (checked 13.11.2026); 7.14.0 fails in Setup ROCm with
         # "Could not find a version that satisfies the requirement rocm==7.14.0".
-        # This is also the version the production binaries are built against.
-        default: "10.0.0"
+        # 10.1.0 = the runtime production runs on (10.0 had a bug); fetch-ci-curl.sh copies the 10.1.0 runtime DLLs.
+        default: "10.1.0"
       fa_all_quants:
         description: "GGML_CUDA_FA_ALL_QUANTS (ON = FA instancie pre vsetky kombinacie typov K/V, napr. K f16 + V q8_0)"
         required: false
