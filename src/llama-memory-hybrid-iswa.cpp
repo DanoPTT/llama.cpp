@@ -25,6 +25,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -59,6 +60,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         rs_size,
         n_seq_max,
         n_rs_seq,
+        n_rs_batch,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
@@ -191,6 +193,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+uint32_t llama_memory_hybrid_iswa::graph_extra_entries() const {
+    // only the attention (iSWA) cache rotates; the recurrent memory has no K/V rotation
+    return mem_attn->graph_extra_entries();
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

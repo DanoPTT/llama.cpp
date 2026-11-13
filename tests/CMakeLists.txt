@@ -180,6 +180,11 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+llama_build(test-recurrent-state-depth.cpp)
+llama_build(test-logits-width-probe.cpp)
+llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
+# multi-sequence gate/beta fusion regression (issue #204): no model needed, skips without a CUDA device
+llama_build_and_test(test-fusion-gate-beta-multiseq.cpp LINK ggml)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -228,6 +233,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build(test-llama-archs.cpp)
+llama_build_and_test(test-lazy-reader.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
@@ -285,6 +291,27 @@ set_tests_properties(test-llama-context PROPERTIES
     ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
 )
 
+# snapshots for the speculative verify band: n_rs_seq 1..15 through the
+# full rollback range, compared against a sequential reference
+llama_test(
+    test-recurrent-state-depth
+    LABEL main
+    ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+)
+set_tests_properties(test-recurrent-state-depth PROPERTIES
+    FIXTURES_REQUIRED generate-models
+)
+
+llama_test(
+    test-recurrent-state-depth
+    NAME test-recurrent-state-depth-qwen4exp
+    LABEL main
+    ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+)
+set_tests_properties(test-recurrent-state-depth-qwen4exp PROPERTIES
+    FIXTURES_REQUIRED generate-models
+)
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
@@ -339,6 +366,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-speculative-adaptive.cpp)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

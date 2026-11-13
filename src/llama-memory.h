@@ -29,6 +29,15 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    // wip/kv-residency (TODO #118) B-A: may this memory's ATTENTION cache take the attendance pool
+    // (`--kv-attendance-pool`, alias `--kv-region-pool`)?  Only the trunk's: the MTP draft's cache is read
+    // densely, so pooling it would only make its reads leave VRAM.
+    bool kv_pool;
+
+    // ...and whether the pool was ASKED for: 0 = off (default), non-zero = on.  The size is derived from the
+    // model (one decode band of the indexer working set), so a legacy numeric request is ignored (r247).
+    int32_t kv_pool_cells;
 };
 
 // the tensor contexts and backend buffers of a memory instance
@@ -149,6 +158,28 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's footprint -- the compact device pool that is
+    // VRAM and the pinned host mirror that holds the whole context.  Both 0 when the pool is off.  It is not
+    // derivable from `memory_breakdown()`: the mirror and the pool live behind different buffer types AND
+    // the mirror's bytes are reported against the host bucket (memory_breakdown() charges them there so
+    // `--fit` sizes a context around the pool), so `--fit` could not tell a pooled cache from a plain one.
+    virtual void kv_pool_bytes(size_t & vram, size_t & ram) const {
+        vram = 0;
+        ram  = 0;
+    }
+
+    // the graph entries (nodes + leafs) this memory module's graph builders add to EVERY graph, on top of
+    // what the model's own builder produces.  Today that is the KV Hadamard rotation: a rotated cache
+    // inserts two `llama_mul_mat_hadamard` chains (cont/reshape + mul_mat + reshape = 3 nodes each) per
+    // rotated tensor per layer, and -- since upstream #31073 keeps the rotation constants on the device --
+    // one graph LEAF per rotated tensor per layer.  `graph_max_nodes()` is what sizes the scheduler's hash
+    // table and its node/leaf id arrays, and both are indexed over nodes AND leafs, so a budget that does
+    // not cover this aborts inside `ggml_backend_sched_split_graph` with "visited all hash table entries"
+    // (github.com/stew675/llama-cpp-rdna-boosts/issues/302: phi-4 with a q8_0 cache adds 12 nodes and 2
+    // leafs per layer, ~560 entries of a 1944-entry budget).  Counted from the tensors the cache really
+    // created, so there is no second copy of the predicate to keep in sync.
+    virtual uint32_t graph_extra_entries() const { return 0; }
 
     //
     // state write/read

@@ -69,6 +69,7 @@ static std::string llama_format_win_err(DWORD err) {
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    std::string fname;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -84,7 +85,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -95,7 +96,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -317,11 +318,11 @@ struct llama_file::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
+    void read_aligned_chunk(void * dest, size_t size_l) {
         size_t offset = tell();
         off_t aligned_offset = offset & ~(alignment - 1);
         off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+        size_t bytes_to_read = (offset_from_alignment + size_l + alignment - 1) & ~(alignment - 1);
 
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
@@ -345,7 +346,7 @@ struct llama_file::impl {
             const size_t n = std::min(buffer_size, bytes_to_read - done);
             read_raw_unsafe(buffer.get(), n);
 
-            const size_t count = std::min(n - skip, size - copied);
+            const size_t count = std::min(n - skip, size_l - copied);
             memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
 
             copied += count;
@@ -419,6 +420,8 @@ llama_file::~llama_file() = default;
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
+const std::string & llama_file::path() const { return pimpl->fname; }
+
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
@@ -478,10 +481,12 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    int fd = -1;   // r273: kept so a released range's page-cache copy can be dropped (see `unmap_fragment`)
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
+        this->fd = fd;   // r273: retained for the post-unmap DONTNEED
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -553,22 +558,38 @@ struct llama_mmap::impl {
         GGML_ASSERT(last % page_size == 0);
         GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // Only munmap the parts that are still mapped: a tensor whose data has been uploaded to a
+        // device is unmapped as soon as it is loaded, so the final offload cleanup must not munmap
+        // the same range twice (munmap of an unmapped range fails) and must keep the fragments
+        // pointing into the mapping intact.
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
+            const size_t lo = std::max(frag.first, first);
+            const size_t hi = std::min(frag.second, last);
+            if (lo < hi) {
+                if (munmap((char *) addr + lo, hi - lo)) {
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                }
+#ifdef __linux__
+                // r273: drop the page-cache copy of a tensor that has just been uploaded to a device and
+                // UNMAPPED.  It is read exactly once and never again, so those pages are pure overhead next
+                // to the device copy -- and while the range was MAPPED, `posix_fadvise` could not drop them at
+                // all (it skips mapped pages, which is why the delivered path left them to reclaim).  This is
+                // the cheap half of "do not flush the system page cache for weights that are already placed":
+                // the release is per tensor and already exists, the drop just was not asked for.  It does not
+                // change the read transport (a mapped upload stays mapped and fast); it removes what is left
+                // behind afterwards.  `MOE_LAZY`/host-expert tensors never reach here (they are not released).
+                if (fd >= 0 && posix_fadvise(fd, (off_t) lo, (off_t) (hi - lo), POSIX_FADV_DONTNEED)) {
+                    LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n",
+                            strerror(errno));
+                }
+#endif
+                if (frag.first < first) {
+                    new_mapped_fragments.emplace_back(frag.first, first);
+                }
+                if (frag.second > last) {
+                    new_mapped_fragments.emplace_back(last, frag.second);
+                }
             } else {
                 new_mapped_fragments.push_back(frag);
             }
@@ -636,8 +657,24 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // A view cannot be unmapped in part, so drop the range's pages from the working set
+        // instead: the range has been copied to a device (or a non-mapping host buffer), and
+        // its clean file pages otherwise stay resident next to that copy for as long as the
+        // process lives.  VirtualUnlock on pages that are not locked does exactly that (and
+        // reports ERROR_NOT_LOCKED); the pages move to the standby list.
+        static const size_t page_size = [] {
+            SYSTEM_INFO info;
+            GetSystemInfo(&info);
+            return (size_t) info.dwPageSize;
+        }();
+        first = (first + page_size - 1) / page_size * page_size;
+        last  = std::min(last, size) / page_size * page_size;
+        if (last <= first) {
+            return;
+        }
+        if (!VirtualUnlock((char *) addr + first, last - first) && GetLastError() != ERROR_NOT_LOCKED) {
+            LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(GetLastError()).c_str());
+        }
     }
 
     ~impl() {
@@ -699,8 +736,8 @@ struct llama_mlock::impl {
         return (size_t) sysconf(_SC_PAGESIZE);
     }
 
-    bool raw_lock(const void * addr, size_t size) const {
-        if (!mlock(addr, size)) {
+    bool raw_lock(const void * addr_l, size_t size_l) const {
+        if (!mlock(addr_l, size_l)) {
             return true;
         }
 
@@ -724,13 +761,13 @@ struct llama_mlock::impl {
         if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
             suggest = false;
         }
-        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size)) {
+        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size_l)) {
             suggest = false;
         }
 #endif
 
         LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+                size_l, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
         return false;
     }
 
@@ -827,6 +864,18 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+size_t llama_mlock::size() const { return pimpl->size; }
+
+// Release the pin without dropping the pages: `munlock` only clears the VM_LOCKED flag, so everything the
+// mlock pulled in stays in the page cache and stays hot -- it just becomes reclaimable again, which is what a
+// box that is over-committed (a full expert arena + the model mapping beside a multi-GiB lazy table) needs.
+void llama_mlock::release() {
+    if (pimpl->size > 0) {
+        impl::raw_unlock((uint8_t *) pimpl->addr, pimpl->size);
+        pimpl->size = 0;
+    }
+}
+size_t llama_mlock::granularity() { return impl::lock_granularity(); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

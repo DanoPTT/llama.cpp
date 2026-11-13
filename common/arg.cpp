@@ -340,9 +340,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_type_draft_mtp = params.speculative.has_mtp();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -1700,6 +1698,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--kv-window"}, "[auto|N]",
+        string_format("the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N "
+                      "cells (default: %s).  The newest N cells stay in VRAM and everything older moves to pinned "
+                      "system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  "
+                      "LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe "
+                      "link, which costs 11-26 %% of decode once your request is deeper than the window.  'auto' "
+                      "is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a "
+                      "placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device "
+                      "CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the "
+                      "drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias",
+                      params.kv_resident_cells < 0 ? "auto" : std::to_string(params.kv_resident_cells).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.kv_resident_cells = -1;
+            } else if (is_falsey(value)) {
+                params.kv_resident_cells = 0;
+            } else {
+                try {
+                    const int v = std::stoi(value);
+                    if (v < 0) {
+                        throw std::invalid_argument("negative");
+                    }
+                    params.kv_resident_cells = v;
+                } catch (...) {
+                    throw std::invalid_argument(
+                        string_format("error: unknown value for --kv-window: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-attendance-pool", "--kv-region-pool"}, "[on|off]",
+        string_format("take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: %s).  The KV's "
+                      "AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of "
+                      "indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is "
+                      "one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block "
+                      "geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated "
+                      "GPU, and while the resident window is active -- the two are ALTERNATIVES for the same "
+                      "bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool "
+                      "instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 %% of "
+                      "pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from "
+                      "the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is "
+                      "accepted for compatibility and IGNORED",
+                      params.kv_region_pool != 0 ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                // the r246 spelling for "the system's size": still ON, and the cache says the value is ignored
+                params.kv_region_pool = -1;
+            } else if (common_arg_utils::is_truthy(value)) {
+                params.kv_region_pool = 1;
+            } else if (is_falsey(value)) {
+                params.kv_region_pool = 0;
+            } else {
+                try {
+                    // a legacy numeric size (r246): accepted, and IGNORED by the cache -- it stays non-zero so
+                    // the cache can SEE that a size was asked for and say it is not a knob any more
+                    params.kv_region_pool = std::stoi(value);
+                } catch (...) {
+                    throw std::invalid_argument(string_format(
+                        "error: unknown value for --kv-attendance-pool: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_REGION_POOL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
@@ -2666,7 +2729,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
+        "- dio: use DirectIO if available\n"
+        "- buffered: mmap the model, but read host weights with buffered reads (a `pread` through the page\n"
+        "  cache) instead of faulting them out of the mapping\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
@@ -2674,19 +2739,148 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else if (value == "buffered")   { params.load_mode = LLAMA_LOAD_MODE_BUFFERED;   }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"--host-experts"}, "MODE",
+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+        "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
+        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default MOE_HOST_POOL_FRAC=80% of\n"
+        "        the host expert bytes, capped by MOE_HOST_POOL_RAM_PCT of MemAvailable).\n"
+        "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+        "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
+        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+        [](common_params & params, const std::string & value) {
+            fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "
+                            "(-lme) instead\n");
+            // The mechanism is uniform (every host-expert tier is hipHostMalloc'd) and the budget is the only
+            // thing that varies, so the old spelling has one meaning each: 'pinned' = pin the whole set,
+            // 'pool' = 'auto' (which picks the pool when the set does not fit).
+            /**/ if (value == "auto")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_limit_gib = -1; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+            else if (value == "pool")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ));
+    add_opt(common_arg(
+        {"-lme", "--limit-host-experts"}, "auto|N",
+        "cap the NON-SWAPPABLE memory spent on MoE experts that are not in VRAM (default: auto)\n"
+        "On a discrete GPU (host-resident experts, --n-cpu-moe/-ncmoe):\n"
+        "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
+        "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
+        "        bounded pinned pool (MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC) serves the reads.  It is decided at\n"
+        "        load, before any tensor is placed, and logged once.\n"
+        "- N:    pin N GiB of host experts, spent on WHOLE tensors in descending hotness order (the persisted\n"
+        "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
+        "        The rest stays in the model mapping.  An explicit N is honoured EXACTLY: the pool's\n"
+        "        MOE_HOST_POOL_RAM_PCT ceiling scales only a DERIVED budget, never a number you typed.\n"
+        "        N is refused only at or above 100% of the memory currently available (that memory cannot be\n"
+        "        swapped out); between 85% and 100% it is accepted with a warning, and if headroom runs out the\n"
+        "        pool's prewarm stops placing and the rest grows on demand.\n"
+        "On an integrated GPU (APU, one shared host/device memory pool) this is the SIZE OF THE REGISTERED GTT\n"
+        "EXPERT STORE: a registered, huge-page region of host memory that the GPU reads in place, sliced into\n"
+        "per-(tensor, expert) slots.  No -ncmoe is needed (host-expert offload is refused there), and the same\n"
+        "budget and the same heat ranking apply -- N GiB spent on the hottest expert tables, the rest stays\n"
+        "on its layer's device buffer:\n"
+        "- auto: the whole expert set when it fits MOE_HOST_LIMIT_FRAC of MemAvailable (then nothing is ever\n"
+        "        evicted), otherwise that ceiling as a bounded hot subset.\n"
+        "- N:    exactly N GiB of registered GTT store (capped at the set).  N is refused only at or above 100%\n"
+        "        of the memory currently available, for the same reason as above.\n"
+        "The store must be LOCKED to be a reservation: a registered-but-unlocked region is reclaimable under\n"
+        "memory pressure (pages swapped, huge pages split, the next read 12-37x slower -- measured).  So the\n"
+        "extent is clamped to RLIMIT_MEMLOCK (`ulimit -l`), and a model that only fits because of the store is\n"
+        "REFUSED when it cannot be locked at all, rather than silently degrading.  `-lme auto` sizes to whatever\n"
+        "the limit allows.  MOE_EXPERT_GTT=0 disables the store on an APU; MOE_EXPERT_GTT_MLOCK=0 leaves it\n"
+        "unlocked (diagnostic: reclaimable by design).  (--host-experts pinned|pool are deprecated shorthands\n"
+        "for the same budget.)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.host_experts_limit_gib = 0;
+                params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
+                return;
+            }
+            char * end = nullptr;
+            const long long n = strtoll(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0' || n < 0) {
+                throw std::invalid_argument("expected 'auto' or a number of GiB");
+            }
+            params.host_experts_limit_gib = (int64_t) n;
+            params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
+            if (n > 0) {
+                // Refuse a budget that would make most of RAM non-swappable -- on a discrete box that is the
+                // pinned host master, on an APU it is the registered GTT expert store, and both are registered
+                // (non-swappable) host memory.  Checked here, where the user gets the error before a 20-70 GiB
+                // model load; the exact figure is re-checked when the tier is sized (the loader knows the
+                // expert bytes and MemAvailable then).
+                FILE * mi = fopen("/proc/meminfo", "r");
+                long long avail_mib = -1;
+                if (mi != nullptr) {
+                    char line[256];
+                    while (fgets(line, sizeof(line), mi) != nullptr) {
+                        if (strncmp(line, "MemAvailable:", 13) == 0) { avail_mib = atoll(line + 13) / 1024; break; }
+                    }
+                    fclose(mi);
+                }
+                // r273: REFUSE ONLY AT (OR ABOVE) 100 % OF WHAT IS AVAILABLE, and say so in the same units the
+                // operator used.  The old test was `n*1024 > avail_mib*90/100` but the message rounded the
+                // allowance to whole GiB, so it refused `-lme 75` while telling the operator they were allowed
+                // 80 -- an explicit number is the operator deliberately spending the non-swappable budget, and
+                // the refusal has to be both TRUE and legible to be worth having.  Below 100 % the pin is
+                // honoured in full (a verified `cudaHostAlloc` refusal reports itself, and the prewarm gate
+                // stops placing when headroom runs out), so the band in between is a WARNING, not an error.
+                if (avail_mib > 0) {
+                    const long long want_mib = (long long) n * 1024;
+                    const double    pct      = 100.0 * (double) want_mib / (double) avail_mib;
+                    char msg[640];
+                    if (want_mib >= avail_mib) {
+                        snprintf(msg, sizeof(msg),
+                            "--limit-host-experts %lld GiB (%lld MiB) is not less than the memory currently "
+                            "available (%lld MiB = %.1f GiB, %.0f %%): that memory is non-swappable, so it is "
+                            "refused.  Use 'auto', a smaller N, or free memory first.",
+                            (long long) n, want_mib, avail_mib, (double) avail_mib / 1024.0, pct);
+                        throw std::invalid_argument(msg);
+                    }
+                    if (pct >= 85.0) {
+                        fprintf(stderr,
+                            "warning: --limit-host-experts %lld GiB is %.1f %% of the %lld MiB (%.1f GiB) "
+                            "currently available.  It is honoured in full; if the box runs out of headroom the "
+                            "host pool's prewarm stops placing and the rest grows on demand "
+                            "(MOE_HOST_POOL_PREWARM_RESERVE_MIB, default 1024 MiB), and a refused pinned "
+                            "allocation is reported rather than silently retried.\n",
+                            (long long) n, pct, avail_mib, (double) avail_mib / 1024.0);
+                    }
+                }
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- auto: on, but only for tensors larger than 4 GiB; the optional managed host-arena\n"
+        "        PLE reader is enabled with LLAMA_LAZY_BUF_MB=<MiB>\n"
+        "- off: always keep them resident, even with a mapped load (--load-mode mmap):\n"
+        "       the tensors are read into host RAM instead of being served from the mapping\n"
+        "- mlock: on, and every row of such a tensor is also pulled into the page cache and\n"
+        "         pinned there (mlock) at load, so it can never be reclaimed; the pages are read\n"
+        "         from the mapping on demand exactly as in on, and the pin is released when the\n"
+        "         process exits (the pages then go back to being ordinary reclaimable cache)\n"
+        "- mlockr: mlock, but the pin is released as soon as loading is done (munlock, nothing is\n"
+        "          dropped): the tables are populated and stay hot in the page cache, and are\n"
+        "          reclaimable again.  Prefer this over mlock when something else also wants the\n"
+        "          RAM during the run -- an auto-sized expert arena, for one, where an unevictable\n"
+        "          multi-GiB table leaves the model mapping as the only memory the kernel can take\n"
+        "          back, so host-expert misses intermittently come from disk",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
-            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
-            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+            /**/ if (value == "on")    { params.lazy_mode = LLAMA_LAZY_MODE_ON;    }
+            else if (value == "auto")  { params.lazy_mode = LLAMA_LAZY_MODE_AUTO;  }
+            else if (value == "off")   { params.lazy_mode = LLAMA_LAZY_MODE_OFF;   }
+            else if (value == "mlock") { params.lazy_mode = LLAMA_LAZY_MODE_MLOCK; }
+            else if (value == "mlockr") { params.lazy_mode = LLAMA_LAZY_MODE_MLOCKR; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
@@ -2736,11 +2930,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU (set\n"
+        "LLAMA_HOST_EXPERTS_FROM_END=0 to restore the historical first-N placement)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -2796,12 +2992,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor,relaxed-tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "- relaxed-tensor: tensor split that also admits a replicated tensor whose values differ per GPU\n"
+        "  (a per-device scalar, undone per GPU before the reduction). Not bit-identical to a single GPU\n"
+        "  on backends whose src1 rescale is non-linear; needed for the MoE amax arches (flint, mellum,\n"
+        "  mistral4), which plain tensor split refuses",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2811,6 +3011,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "tensor") {
                 params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else if (value == "relaxed-tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_RELAXED_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -4117,12 +4319,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_k)
+            "(default: follows the main model's --cache-type-k, so lowering the main KV type for VRAM "
+            "takes the draft with it; set this to pin the draft's own type)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_k_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -4130,12 +4333,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
-            "(default: %s)",
-            get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.draft.cache_type_v)
+            "(default: follows the main model's --cache-type-v, so lowering the main KV type for VRAM "
+            "takes the draft with it; set this to pin the draft's own type)",
+            get_all_kv_cache_types().c_str()
         ),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v     = kv_cache_type_from_str(value);
+            params.speculative.draft.cache_type_v_set = true;
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
@@ -4153,25 +4357,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
         {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU for the draft model",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.speculative.draft.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding (default: %d, max: 15)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            // Values above 15 are clamped, and values above 7 get a purity notice, in
+            // common_init_from_params - not here: argument-parser callbacks cannot know the final
+            // verbosity, and the notice belongs with the other range validation.  The 15 cap is the
+            // recurrent rollback snapshot bound (a verify batch decodes n_max + 1 rows and is a
+            // K <= 16 batch); above 7 the flash-attention chooser switches kernel family above 8
+            // rows, which can change greedy output between --spec-type none and draft-mtp.  Both
+            // notices are W level: llama-server's default INFO threshold shows them, while
+            // llama-cli's default ERROR threshold hides them (-lv 2 to see them).
             params.speculative.draft.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-vocab"}, "N",
+        string_format("MTP: compute draft logits over token ids < N plus control tokens only; verification is unchanged "
+                      "(0 = full vocabulary, default: %d)", params.speculative.draft.mtp_vocab),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_vocab = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
@@ -4189,6 +4410,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ubatch = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-draft-kv-window"}, "[auto|N]",
+        string_format("MTP only: the draft context's own KV window, in cells per sequence -- 'auto', '0' (a full "
+                      "`-c` draft cache, the DEFAULT), or N cells (default: %s).  The draft context carries a KV of "
+                      "its own, sized `-c` (one draft layer: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144`), "
+                      "although the drafter only reads its recent prefix; a window makes it a ring instead.  This is "
+                      "an APPROXIMATION the target verifies: a truncated draft is a slower run, never a wrong "
+                      "answer.  'auto' is THE CAP OR NOTHING -- 65536 cells, or no window at all when 65536 would "
+                      "not leave a batch of room below every sequence's own context.  OFF by default since r247: "
+                      "a window the request outgrows costs draft acceptance AND a per-step cost past the ring wrap "
+                      "(measured -9.7 %% of MTP decode on a tensor split at 105k tokens; "
+                      "benchmarks/mtp-draft-window-depth.md), so 'auto' and N are a conscious opt-in.  "
+                      "Formerly the LLAMA_SPEC_DRAFT_WINDOW env var",
+                      params.speculative.draft.kv_window < 0 ? "auto" : std::to_string(params.speculative.draft.kv_window).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.speculative.draft.kv_window = -1;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.kv_window = 0;
+            } else {
+                try {
+                    params.speculative.draft.kv_window = std::max(0, std::stoi(value));
+                } catch (...) {
+                    throw std::invalid_argument(
+                        string_format("error: unknown value for --spec-draft-kv-window: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_KV_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-n-start"}, "N",
+        "initial adaptive MTP draft depth: the first verify round of each generation starts here "
+        "instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, "
+        "--spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. "
+        "verbatim recall) or shallower for a short generation at a deep context, where a wide "
+        "verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_start = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_START"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
