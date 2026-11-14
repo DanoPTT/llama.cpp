@@ -693,7 +693,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int k0_stop = k0_start + nbatch_K2 < DKQp/2 ? k0_start + nbatch_K2 : DKQp/2;
 
         if constexpr (nstages <= 1) {
-            const int k0_diff = min(k0_stop, DKQ/2) - k0_start; // Only load the real head size from global memory.
+            const int k0_diff = DKQp == DKQ ? k0_stop - k0_start : min(k0_stop, DKQ/2) - k0_start; // stew r281 block 05 (#311): no min() clamp on unpadded heads
             constexpr bool use_cp_async = nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
@@ -1045,7 +1045,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int i0_stop = i0_start + 2*nbatch_V2;
 
         if constexpr (nstages <= 1) {
-            const int i0_diff = min(i0_stop, DV) - i0_start; // Only load the real head size from global memory.
+            const int i0_diff = DVp == DV ? i0_stop - i0_start : min(i0_stop, DV) - i0_start; // see k0_diff
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                 constexpr bool use_cp_async = nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
