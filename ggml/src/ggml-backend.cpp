@@ -2459,9 +2459,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // inputs of nodes that are not computed (e.g. the unselected branches of ggml_build_forward_select)
                     // stay in the split so that the allocation does not change, but they do not need to be copied
-                    if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                        sched->hv_tensor_requires_copy[src_id] = true;
-                    }
+                    // f711 A/B: upstream #31419 neutralized (every split input is uploaded again, as before #31419)
+                    sched->hv_tensor_requires_copy[src_id] = true;
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
